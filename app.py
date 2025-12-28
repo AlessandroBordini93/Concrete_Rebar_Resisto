@@ -1,4 +1,8 @@
 # app.py  —  RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
+# MOD: DISTF = "finestra gonfiata": le linee V/H NON spariscono -> vengono TAGLIATE (clipping) solo dove
+#      intersecano la finestra gonfiata. Le diagonali (e stiffness) possono reminder “skip” se attraversano l’offset.
+# NOTE: Input/Output invariati (stessi endpoint, stesso payload, stesso JSON di ritorno).
+
 from __future__ import annotations
 
 import math
@@ -149,11 +153,24 @@ def _footer(c: canvas.Canvas, W, H):
 # ============================================================
 #  GEOMETRY UTILITIES
 # ============================================================
-def ok_seg(x1, y1, x2, y2, wins: List[Window]) -> bool:
+def win_box(w: Window, pad: float = 0.0) -> Tuple[float, float, float, float]:
+    return (w.x - pad, w.y_abs - pad, w.x + w.w + pad, w.y_abs + w.h + pad)
+
+def _box_intersect(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    return not (ax2 < bx1 or ax1 > bx2 or ay2 < by1 or ay1 > by2)
+
+def ok_seg(x1, y1, x2, y2, wins: List[Window], *, DISTF: float = 0.0) -> bool:
+    """
+    True se il bounding-box del segmento NON interseca nessuna finestra gonfiata di DISTF.
+    (Per diagonali/stiffness va bene la logica "skip".)
+    """
     xmin, xmax = sorted((x1, x2))
     ymin, ymax = sorted((y1, y2))
+    seg_box = (xmin, ymin, xmax, ymax)
     for w in wins:
-        if not (xmax < w.x or xmin > w.x + w.w or ymax < w.y_abs or ymin > w.y_abs + w.h):
+        if _box_intersect(seg_box, win_box(w, pad=DISTF)):
             return False
     return True
 
@@ -193,23 +210,62 @@ def primarie(nodes, *, vertical: bool, PASSO: int, CLEAR: int):
         )
     return full, base
 
+def _ok_axis_value_global(v: float, wins: List[Window], asse: str, DISTF: float) -> bool:
+    # vietato se la coordinata cade dentro l'intervallo della finestra gonfiata
+    if asse == "x":
+        for w in wins:
+            if (w.x - DISTF) < v < (w.x + w.w + DISTF):
+                return False
+        return True
+    else:
+        for w in wins:
+            if (w.y_abs - DISTF) < v < (w.y_abs + w.h + DISTF):
+                return False
+        return True
+
 def linee_finestre(grid: List[float], wins: List[Window], asse: str, DISTF: int) -> List[float]:
-    extra = []
+    """
+    Seleziona linee attorno alle finestre gonfiate (DISTF).
+    FIX importante: la linea candidata NON deve cadere dentro l’offset di NESSUNA finestra.
+    """
+    grid = sorted(grid)
+    extra: List[float] = []
+
     for w in wins:
         if asse == "x":
-            L, R = w.x - DISTF, w.x + w.w + DISTF
-            cand = [m for m in grid if m <= L or m >= R]
-            sx = max([m for m in cand if m <= L], default=None)
-            dx = min([m for m in cand if m >= R], default=None)
-            if sx is not None: extra.append(sx)
-            if dx is not None: extra.append(dx)
+            L = w.x - DISTF
+            R = w.x + w.w + DISTF
+
+            i_sx = bisect.bisect_right(grid, L) - 1
+            while i_sx >= 0 and not _ok_axis_value_global(grid[i_sx], wins, "x", DISTF):
+                i_sx -= 1
+
+            i_dx = bisect.bisect_left(grid, R)
+            while i_dx < len(grid) and not _ok_axis_value_global(grid[i_dx], wins, "x", DISTF):
+                i_dx += 1
+
+            if i_sx >= 0:
+                extra.append(grid[i_sx])
+            if i_dx < len(grid):
+                extra.append(grid[i_dx])
+
         else:
-            B, T = w.y_abs - DISTF, w.y_abs + w.h + DISTF
-            cand = [m for m in grid if m <= B or m >= T]
-            giu = max([m for m in cand if m <= B], default=None)
-            su  = min([m for m in cand if m >= T], default=None)
-            if giu is not None: extra.append(giu)
-            if su  is not None: extra.append(su)
+            B = w.y_abs - DISTF
+            T = w.y_abs + w.h + DISTF
+
+            i_giu = bisect.bisect_right(grid, B) - 1
+            while i_giu >= 0 and not _ok_axis_value_global(grid[i_giu], wins, "y", DISTF):
+                i_giu -= 1
+
+            i_su = bisect.bisect_left(grid, T)
+            while i_su < len(grid) and not _ok_axis_value_global(grid[i_su], wins, "y", DISTF):
+                i_su += 1
+
+            if i_giu >= 0:
+                extra.append(grid[i_giu])
+            if i_su < len(grid):
+                extra.append(grid[i_su])
+
     return sorted(set(extra))
 
 def intermedie(lines: List[float], PASSO: int) -> List[float]:
@@ -228,6 +284,53 @@ def intermedie(lines: List[float], PASSO: int) -> List[float]:
             rem = b - pos
     return out
 
+# --- clipping V/H: tagliare i segmenti sulle finestre gonfiate ---
+def _merge_intervals(ints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if not ints:
+        return []
+    ints = sorted((min(a, b), max(a, b)) for a, b in ints)
+    out = [ints[0]]
+    for a, b in ints[1:]:
+        la, lb = out[-1]
+        if a <= lb:
+            out[-1] = (la, max(lb, b))
+        else:
+            out.append((a, b))
+    return out
+
+def _subtract_intervals(base: Tuple[float, float], cuts: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    a, b = min(base), max(base)
+    cuts = _merge_intervals([(max(a, c1), min(b, c2)) for c1, c2 in cuts if not (c2 <= a or c1 >= b)])
+    if not cuts:
+        return [(a, b)]
+    out: List[Tuple[float, float]] = []
+    cur = a
+    for c1, c2 in cuts:
+        if c1 > cur:
+            out.append((cur, c1))
+        cur = max(cur, c2)
+    if cur < b:
+        out.append((cur, b))
+    return out
+
+def clip_vertical_segment(x: float, y1: float, y2: float, wins: List[Window], DISTF: float) -> List[Tuple[float, float]]:
+    ya, yb = min(y1, y2), max(y1, y2)
+    cuts: List[Tuple[float, float]] = []
+    for w in wins:
+        xmin, ymin, xmax, ymax = win_box(w, pad=DISTF)
+        if xmin < x < xmax:
+            cuts.append((ymin, ymax))
+    return _subtract_intervals((ya, yb), cuts)
+
+def clip_horizontal_segment(y: float, x1: float, x2: float, wins: List[Window], DISTF: float) -> List[Tuple[float, float]]:
+    xa, xb = min(x1, x2), max(x1, x2)
+    cuts: List[Tuple[float, float]] = []
+    for w in wins:
+        xmin, ymin, xmax, ymax = win_box(w, pad=DISTF)
+        if ymin < y < ymax:
+            cuts.append((xmin, xmax))
+    return _subtract_intervals((xa, xb), cuts)
+
 
 # ============================================================
 #  STIFFNESS
@@ -236,7 +339,7 @@ def diagonali_rigidezze(
     Xall: List[float], Yall: List[float],
     cols: List[Column], beams: List[Beam],
     wins: List[Window],
-    *, EA: float, CLEAR: int
+    *, EA: float, CLEAR: int, DISTF: int
 ) -> Dict[Tuple[int, int], List[List[float]]]:
 
     Xstr = [x for x in Xall if any(abs(x - c.x_axis) <= c.spess/2 - CLEAR + 1e-6 for c in cols)]
@@ -250,7 +353,8 @@ def diagonali_rigidezze(
         for iy in range(len(Yall) - 1):
             x1, x2 = Xall[ix], Xall[ix + 1]
             y1, y2 = Yall[iy], Yall[iy + 1]
-            if not ok_seg(x1, y1, x2, y2, wins):
+            # diagonali: skip se attraversano la finestra gonfiata
+            if not ok_seg(x1, y1, x2, y2, wins, DISTF=DISTF):
                 continue
             j = bisect.bisect_right(Xstr, x1) - 1
             i = bisect.bisect_right(Ystr, y1) - 1
@@ -435,7 +539,10 @@ def _extra_pages(
 # ============================================================
 #  DXF EXPORT
 # ============================================================
-def _export_dxf(cols, beams, finestre, X, Y, path: Path) -> bool:
+def _export_dxf(cols, beams, finestre, X, Y, *, DISTF: int, path: Path) -> bool:
+    """
+    MOD: V/H tagliate (clipping) sulle finestre gonfiate. Diagonali skip su finestre gonfiate.
+    """
     if ezdxf is None:
         return False
 
@@ -463,23 +570,30 @@ def _export_dxf(cols, beams, finestre, X, Y, path: Path) -> bool:
 
     add = lambda a, b: m.add_line(a, b, dxfattribs={'layer': 'Resisto'})
 
+    # verticali (clipping)
     for x in X:
         for y1, y2 in zip(Y[:-1], Y[1:]):
-            if ok_seg(x, y1, x, y2, finestre):
-                add((x, y1), (x, y2))
+            parts = clip_vertical_segment(x, y1, y2, finestre, DISTF=DISTF)
+            for ya, yb in parts:
+                if yb > ya:
+                    add((x, ya), (x, yb))
 
+    # orizzontali (clipping)
     for y in Y:
         for x1, x2 in zip(X[:-1], X[1:]):
-            if ok_seg(x1, y, x2, y, finestre):
-                add((x1, y), (x2, y))
+            parts = clip_horizontal_segment(y, x1, x2, finestre, DISTF=DISTF)
+            for xa, xb in parts:
+                if xb > xa:
+                    add((xa, y), (xb, y))
 
+    # diagonali (skip)
     for i in range(len(X) - 1):
         for j in range(len(Y) - 1):
             a, b = X[i], X[i + 1]
             c_, d_ = Y[j], Y[j + 1]
-            if ok_seg(a, c_, b, d_, finestre):
+            if ok_seg(a, c_, b, d_, finestre, DISTF=DISTF):
                 add((a, c_), (b, d_))
-            if ok_seg(a, d_, b, c_, finestre):
+            if ok_seg(a, d_, b, c_, finestre, DISTF=DISTF):
                 add((a, d_), (b, c_))
 
     doc.saveas(str(path))
@@ -507,7 +621,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     E = float(settings.get("E_MPa", 210000))
     A = float(settings.get("A_mm2", 150))
 
-    # minimi concordati
+    # minimi remindati
     PASSO = max(1, PASSO)
     CLEAR = max(5, CLEAR)
     DISTF = max(10, DISTF)
@@ -638,6 +752,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO, CLEAR=CLEAR)
     Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO, CLEAR=CLEAR)
 
+    # linee “attorno” alle finestre gonfiate
     Xfin = linee_finestre(Xfull, all_w, "x", DISTF=DISTF)
     Yfin = linee_finestre(Yfull, all_w, "y", DISTF=DISTF)
 
@@ -647,31 +762,40 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xall = sorted(set(Xbase + Xfin + Xsec))
     Yall = sorted(set(Ybase + Yfin + Ysec))
 
-    # stats
+    # --------------------------------------------------------
+    # stats (coerenti col disegno): V/H = somma dei tratti CLIPPATI, diagonali = skip
+    # --------------------------------------------------------
     Lh_cm = Lv_cm = Ld_cm = 0.0
     n_o = n_v = n_d = 0
 
+    # orizzontali (clipping)
     for y in Yall:
         for x1, x2 in zip(Xall[:-1], Xall[1:]):
-            if ok_seg(x1, y, x2, y, all_w):
-                n_o += 1
-                Lh_cm += (x2 - x1)
+            parts = clip_horizontal_segment(y, x1, x2, all_w, DISTF=DISTF)
+            for xa, xb in parts:
+                if xb > xa:
+                    n_o += 1
+                    Lh_cm += (xb - xa)
 
+    # verticali (clipping)
     for x in Xall:
         for y1, y2 in zip(Yall[:-1], Yall[1:]):
-            if ok_seg(x, y1, x, y2, all_w):
-                n_v += 1
-                Lv_cm += (y2 - y1)
+            parts = clip_vertical_segment(x, y1, y2, all_w, DISTF=DISTF)
+            for ya, yb in parts:
+                if yb > ya:
+                    n_v += 1
+                    Lv_cm += (yb - ya)
 
+    # diagonali (skip)
     for i in range(len(Xall) - 1):
         for j in range(len(Yall) - 1):
             a, b = Xall[i], Xall[i + 1]
             c_, d_ = Yall[j], Yall[j + 1]
             dlen = math.hypot(b - a, d_ - c_)
-            if ok_seg(a, c_, b, d_, all_w):
+            if ok_seg(a, c_, b, d_, all_w, DISTF=DISTF):
                 n_d += 1
                 Ld_cm += dlen
-            if ok_seg(a, d_, b, c_, all_w):
+            if ok_seg(a, d_, b, c_, all_w, DISTF=DISTF):
                 n_d += 1
                 Ld_cm += dlen
 
@@ -696,7 +820,8 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         f"Area totale                : {area_tot_m2:.2f} m²",
     ]
 
-    rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w, EA=EA, CLEAR=CLEAR)
+    # stiffness (diagonali: skip su finestra gonfiata)
+    rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w, EA=EA, CLEAR=CLEAR, DISTF=DISTF)
 
     Aeq_dict: Dict[Tuple[int, int], float] = {}
     Keq_dict: Dict[Tuple[int, int], float] = {}
@@ -740,23 +865,36 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     Aeq_univoca = (K_eq_u / K_eq_u_adi) if K_eq_u_adi else 0.0
 
+    # --------------------------------------------------------
     # overlays (grid + aeq + univoca)
+    # grid: V/H = clipping, diagonali = skip
+    # --------------------------------------------------------
     grid_entities = []
+
+    # verticali (clipping)
     for x in Xall:
         for y1, y2 in zip(Yall[:-1], Yall[1:]):
-            if ok_seg(x, y1, x, y2, all_w):
-                grid_entities.append(_line((x, y1), (x, y2), layer="grid_v"))
+            parts = clip_vertical_segment(x, y1, y2, all_w, DISTF=DISTF)
+            for ya, yb in parts:
+                if yb > ya:
+                    grid_entities.append(_line((x, ya), (x, yb), layer="grid_v"))
+
+    # orizzontali (clipping)
     for y in Yall:
         for x1, x2 in zip(Xall[:-1], Xall[1:]):
-            if ok_seg(x1, y, x2, y, all_w):
-                grid_entities.append(_line((x1, y), (x2, y), layer="grid_h"))
+            parts = clip_horizontal_segment(y, x1, x2, all_w, DISTF=DISTF)
+            for xa, xb in parts:
+                if xb > xa:
+                    grid_entities.append(_line((xa, y), (xb, y), layer="grid_h"))
+
+    # diagonali (skip)
     for ii in range(len(Xall) - 1):
         for jj in range(len(Yall) - 1):
             a, b = Xall[ii], Xall[ii + 1]
             c_, d_ = Yall[jj], Yall[jj + 1]
-            if ok_seg(a, c_, b, d_, all_w):
+            if ok_seg(a, c_, b, d_, all_w, DISTF=DISTF):
                 grid_entities.append(_line((a, c_), (b, d_), layer="grid_d"))
-            if ok_seg(a, d_, b, c_, all_w):
+            if ok_seg(a, d_, b, c_, all_w, DISTF=DISTF):
                 grid_entities.append(_line((a, d_), (b, c_), layer="grid_d"))
 
     aeq_entities, uni_entities = [], []
@@ -830,6 +968,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "beams": beams,
             "cols": cols,
             "all_w": all_w,
+            "DISTF": DISTF,
         }
     }
 
@@ -853,6 +992,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 
     job_id = cfg["job_id"]
     meta_norm = cfg["meta_norm"]
+    DISTF = cfg["DISTF"]
 
     Xall = computed["internals"]["Xall"]
     Yall = computed["internals"]["Yall"]
@@ -910,7 +1050,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             ax.set_ylabel("Y [cm]")
             ax.grid(True)
 
-        # schema posa
+        # schema posa (MOD: V/H clipping, diagonali skip su finestre gonfiate)
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
@@ -918,23 +1058,30 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         for spine in ax.spines.values():
             spine.set_visible(False)
 
+        # verticali (clipping)
         for x in Xall:
             for y1, y2 in zip(Yall[:-1], Yall[1:]):
-                if ok_seg(x, y1, x, y2, all_w):
-                    ax.plot([x, x], [y1, y2], "k", lw=0.7)
+                parts = clip_vertical_segment(x, y1, y2, all_w, DISTF=DISTF)
+                for ya, yb in parts:
+                    if yb > ya:
+                        ax.plot([x, x], [ya, yb], "k", lw=0.7)
 
+        # orizzontali (clipping)
         for y in Yall:
             for x1, x2 in zip(Xall[:-1], Xall[1:]):
-                if ok_seg(x1, y, x2, y, all_w):
-                    ax.plot([x1, x2], [y, y], "k", lw=0.7)
+                parts = clip_horizontal_segment(y, x1, x2, all_w, DISTF=DISTF)
+                for xa, xb in parts:
+                    if xb > xa:
+                        ax.plot([xa, xb], [y, y], "k", lw=0.7)
 
+        # diagonali (skip)
         for i in range(len(Xall) - 1):
             for j in range(len(Yall) - 1):
                 a, b = Xall[i], Xall[i+1]
                 c_, d_ = Yall[j], Yall[j+1]
-                if ok_seg(a, c_, b, d_, all_w):
+                if ok_seg(a, c_, b, d_, all_w, DISTF=DISTF):
                     ax.plot([a, b], [c_, d_], "k", lw=0.7)
-                if ok_seg(a, d_, b, c_, all_w):
+                if ok_seg(a, d_, b, c_, all_w, DISTF=DISTF):
                     ax.plot([a, b], [d_, c_], "k", lw=0.7)
 
         fig.tight_layout()
@@ -999,7 +1146,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 
     # --- DXF ---
     if export_dxf:
-        dxf_ok = _export_dxf(cols, beams, all_w, Xall, Yall, dxf_path)
+        dxf_ok = _export_dxf(cols, beams, all_w, Xall, Yall, DISTF=DISTF, path=dxf_path)
         if dxf_ok:
             written["dxf"] = dxf_path
 
@@ -1043,7 +1190,7 @@ def export(payload: Payload):
         with tempfile.TemporaryDirectory(prefix="rebarca_") as tmp:
             out_dir = Path(tmp)
 
-            written = render_exports_to_dir(data, computed, out_dir=out_dir)
+            _ = render_exports_to_dir(data, computed, out_dir=out_dir)
 
             # zip in RAM
             mem = BytesIO()
