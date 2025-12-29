@@ -1,11 +1,12 @@
 # app.py — RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
 # MOD:
-# 1) DISTF = "finestra gonfiata" (pad) usata in ok_seg + clipping
-# 2) Linee “a fianco finestre” (Xfin/Yfin): selezionate considerando la finestra gonfiata e FILTRATE
-#    per evitare linee che cadono dentro QUALSIASI finestra gonfiata.
-# 3) V/H: clipping + PRUNE dei “trattini” (segmenti dangling)
-# 4) JSON: aggiunto results.stats_table (senza toccare results.stats esistente)
-# NOTE: Input/Output invariati (stessi endpoint, stesso payload, stesso JSON di ritorno).
+# 1) DISTF = "finestra gonfiata" SOLO per: linee vicino finestra + clipping V/H + ok_seg + diagonali
+# 2) Xfin: filtro globale (se cade dentro QUALSIASI finestra gonfiata -> eliminata)  ✅ SOLO X
+#    Yfin: NO filtro globale (finestre affiancate in X ma non in Y) ✅
+# 3) ok_seg + clip_*: contatto sul bordo NON è intersezione/taglio (border-safe)
+# 4) parse_payload: validazione finestre fatta su FINESTRA REALE (non gonfiata),
+#    con vincolo dx>=spess_pil_sx/2 e dy>=spess_trave_inf/2 (misure rispetto agli assi)
+# 5) JSON: aggiunto results.stats_table (senza toccare results.stats)
 
 from __future__ import annotations
 
@@ -54,8 +55,7 @@ except ImportError:
 # CONFIG
 # ============================================================
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
-app = FastAPI(title="RebarCA API", version="2.2 (zip-on-the-fly, stats_table)")
-
+app = FastAPI(title="RebarCA API", version="2.2 (zip-on-the-fly, stats_table, x-only-filter, border-safe, window-real-validate)")
 
 class Payload(RootModel[Dict[str, Any]]):
     pass
@@ -69,12 +69,10 @@ class Beam:
     y_axis: float
     spess: float
 
-
 @dataclass
 class Column:
     x_axis: float
     spess: float
-
 
 @dataclass
 class Window:
@@ -92,24 +90,18 @@ def _must(cond: bool, msg: str):
     if not cond:
         raise ValueError(msg)
 
-
 def slugify(name: str) -> str:
     name = (name or "").strip().lower()
     name = re.sub(r"[^a-z0-9]+", "_", name)
     name = re.sub(r"_+", "_", name).strip("_")
     return name or "x"
 
-
 def safe_suffix(s: str) -> str:
     s = (s or "").strip()
     _must(len(s) > 0, "meta.suffix mancante o vuoto")
     _must(len(s) <= 64, "meta.suffix troppo lungo (max 64)")
-    _must(
-        re.fullmatch(r"[A-Za-z0-9._-]+", s) is not None,
-        "meta.suffix non valido (usa solo A-Z a-z 0-9 . _ -)",
-    )
+    _must(re.fullmatch(r"[A-Za-z0-9._-]+", s) is not None, "meta.suffix non valido (usa solo A-Z a-z 0-9 . _ -)")
     return s
-
 
 ORIENT_MAP = {
     "n": "Nord", "nord": "Nord",
@@ -123,7 +115,6 @@ ORIENT_MAP = {
 }
 ALLOWED_ORIENTATIONS = {"Nord", "Sud", "Est", "Ovest", "Nord-Est", "Nord-Ovest", "Sud-Est", "Sud-Ovest"}
 
-
 def normalize_orientation(s: str) -> str:
     raw = (s or "").strip().lower().replace(" ", "")
     raw = raw.replace("–", "-").replace("—", "-").replace("_", "-")
@@ -131,13 +122,10 @@ def normalize_orientation(s: str) -> str:
     norm = ORIENT_MAP.get(raw_no_dash)
     if norm is not None:
         return norm
-
     s2 = (s or "").strip().replace("–", "-").replace("—", "-")
     if s2 in ALLOWED_ORIENTATIONS:
         return s2
-
     raise ValueError(f"meta.wall_orientation non valida. Valori ammessi: {sorted(ALLOWED_ORIENTATIONS)}")
-
 
 def make_job_id(project_name: str, location_name: str, wall_orientation: str, suffix: str) -> Tuple[str, str]:
     o = normalize_orientation(wall_orientation)
@@ -151,7 +139,6 @@ def make_job_id(project_name: str, location_name: str, wall_orientation: str, su
 def _wrap(txt: str, width=92) -> str:
     return "\n".join(textwrap.fill(p.strip(), width) for p in txt.strip().splitlines())
 
-
 def _footer(c: canvas.Canvas, W, H):
     h5 = H / 15
     c.setFont(FONT_REG, 11)
@@ -160,33 +147,25 @@ def _footer(c: canvas.Canvas, W, H):
 
 
 # ============================================================
-# GEOMETRY UTILITIES (DISTF = finestra gonfiata)
+# GEOMETRY UTILITIES
 # ============================================================
 def win_box(w: Window, pad: float = 0.0) -> Tuple[float, float, float, float]:
     return (w.x - pad, w.y_abs - pad, w.x + w.w + pad, w.y_abs + w.h + pad)
 
-
-# PATCH: contatto bordo != intersezione (evita buchi “sopra finestre”)
-def _box_intersect(
-    a: Tuple[float, float, float, float],
-    b: Tuple[float, float, float, float],
-    eps: float = 1e-9,
-) -> bool:
+def _box_intersect_strict(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], eps: float = 1e-9) -> bool:
+    # "strict": contatto sul bordo NON conta come intersezione
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
-    # se è fuori o in contatto sul bordo -> NON interseca
     return not (ax2 <= bx1 + eps or ax1 >= bx2 - eps or ay2 <= by1 + eps or ay1 >= by2 - eps)
 
-
-def ok_seg(x1, y1, x2, y2, wins: List[Window], *, DISTF: float = 0.0) -> bool:
+def ok_seg(x1, y1, x2, y2, wins: List[Window], *, DISTF: float = 0.0, eps: float = 1e-9) -> bool:
     xmin, xmax = sorted((x1, x2))
     ymin, ymax = sorted((y1, y2))
     seg_box = (xmin, ymin, xmax, ymax)
     for w in wins:
-        if _box_intersect(seg_box, win_box(w, pad=DISTF)):
+        if _box_intersect_strict(seg_box, win_box(w, pad=DISTF), eps=eps):
             return False
     return True
-
 
 def primarie(nodes, *, vertical: bool, PASSO: int, CLEAR: int):
     lo = nodes[0].x_axis if vertical else nodes[0].y_axis
@@ -219,48 +198,53 @@ def primarie(nodes, *, vertical: bool, PASSO: int, CLEAR: int):
     for n in nodes:
         a, sp = (n.x_axis, n.spess) if vertical else (n.y_axis, n.spess)
         base.append(
-            min(
-                (v for v in full if a - sp / 2 + CLEAR <= v <= a + sp / 2 - CLEAR),
-                key=lambda v: abs(v - a),
-            )
+            min((v for v in full if a - sp / 2 + CLEAR <= v <= a + sp / 2 - CLEAR), key=lambda v: abs(v - a))
         )
     return full, base
 
+def inflate_windows(wins: List[Window], DISTF: float) -> List[Window]:
+    if DISTF <= 0:
+        return wins
+    out: List[Window] = []
+    for w in wins:
+        out.append(
+            Window(
+                x=w.x - DISTF,
+                y_rel=w.y_rel,
+                w=w.w + 2 * DISTF,
+                h=w.h + 2 * DISTF,
+                y_abs=w.y_abs - DISTF,
+            )
+        )
+    return out
 
-def _ok_axis_value_global(v: float, wins: List[Window], asse: str, DISTF: float) -> bool:
-    # True se v NON cade strettamente dentro nessuna finestra gonfiata (bordo ok)
-    eps = 1e-9
-    if asse == "x":
-        for w in wins:
-            if (w.x - DISTF + eps) < v < (w.x + w.w + DISTF - eps):
-                return False
-        return True
-    else:
-        for w in wins:
-            if (w.y_abs - DISTF + eps) < v < (w.y_abs + w.h + DISTF - eps):
-                return False
-        return True
-
-
-def linee_finestre(grid: List[float], wins: List[Window], asse: str, DISTF: int) -> List[float]:
+def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> List[float]:
     """
-    Seleziona per ogni finestra le due linee (a passo PASSO già implicito nel 'grid')
-    più vicine ai lati della finestra gonfiata (pad=DISTF), SENZA entrare in nessuna finestra gonfiata.
+    Regola richiesta:
+      - asse="x": scelgo sx/dx per ogni finestra gonfiata, SKIPPANDO candidati che cadono
+        dentro QUALSIASI finestra gonfiata (filtro globale X).
+      - asse="y": scelgo giù/su per ogni finestra gonfiata, SENZA filtro globale.
     """
     grid = sorted(grid)
-    extra: List[float] = []
 
-    for w in wins:
+    def ok_axis_value_global_x(x: float) -> bool:
+        for w in wins_gonf:
+            if (w.x) < x < (w.x + w.w):  # strict inside
+                return False
+        return True
+
+    extra: List[float] = []
+    for w in wins_gonf:
         if asse == "x":
-            L = w.x - DISTF
-            R = w.x + w.w + DISTF
+            L = w.x
+            R = w.x + w.w
 
             i_sx = bisect.bisect_right(grid, L) - 1
-            while i_sx >= 0 and not _ok_axis_value_global(grid[i_sx], wins, "x", DISTF):
+            while i_sx >= 0 and not ok_axis_value_global_x(grid[i_sx]):
                 i_sx -= 1
 
             i_dx = bisect.bisect_left(grid, R)
-            while i_dx < len(grid) and not _ok_axis_value_global(grid[i_dx], wins, "x", DISTF):
+            while i_dx < len(grid) and not ok_axis_value_global_x(grid[i_dx]):
                 i_dx += 1
 
             if i_sx >= 0:
@@ -269,16 +253,10 @@ def linee_finestre(grid: List[float], wins: List[Window], asse: str, DISTF: int)
                 extra.append(grid[i_dx])
 
         else:
-            B = w.y_abs - DISTF
-            T = w.y_abs + w.h + DISTF
-
+            B = w.y_abs
+            T = w.y_abs + w.h
             i_giu = bisect.bisect_right(grid, B) - 1
-            while i_giu >= 0 and not _ok_axis_value_global(grid[i_giu], wins, "y", DISTF):
-                i_giu -= 1
-
             i_su = bisect.bisect_left(grid, T)
-            while i_su < len(grid) and not _ok_axis_value_global(grid[i_su], wins, "y", DISTF):
-                i_su += 1
 
             if i_giu >= 0:
                 extra.append(grid[i_giu])
@@ -287,9 +265,8 @@ def linee_finestre(grid: List[float], wins: List[Window], asse: str, DISTF: int)
 
     return sorted(set(extra))
 
-
 def intermedie(lines: List[float], PASSO: int) -> List[float]:
-    out = []
+    out: List[float] = []
     for a, b in zip(lines[:-1], lines[1:]):
         rem = b - a
         if rem < 2 * PASSO:
@@ -304,7 +281,6 @@ def intermedie(lines: List[float], PASSO: int) -> List[float]:
             rem = b - pos
     return out
 
-
 def _merge_intervals(ints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     if not ints:
         return []
@@ -318,31 +294,23 @@ def _merge_intervals(ints: List[Tuple[float, float]]) -> List[Tuple[float, float
             out.append((a, b))
     return out
 
-
 def _subtract_intervals(base: Tuple[float, float], cuts: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    a, b = (base[0], base[1])
-    if b < a:
-        a, b = b, a
-
+    a, b = min(base), max(base)
     cuts = _merge_intervals([(max(a, c1), min(b, c2)) for c1, c2 in cuts if not (c2 <= a or c1 >= b)])
     if not cuts:
         return [(a, b)]
-
     out: List[Tuple[float, float]] = []
     cur = a
     for c1, c2 in cuts:
         if c1 > cur:
             out.append((cur, c1))
         cur = max(cur, c2)
-        if cur >= b:
-            break
     if cur < b:
         out.append((cur, b))
     return [(x1, x2) for x1, x2 in out if x2 > x1]
 
-
-# PATCH: taglia SOLO se la linea passa strettamente dentro la finestra gonfiata (bordo ok)
 def clip_vertical_segment(x: float, y1: float, y2: float, wins: List[Window], DISTF: float, eps: float = 1e-9) -> List[Tuple[float, float]]:
+    # border-safe: taglio solo se la linea passa "dentro" (strict) la proiezione X della finestra gonfiata
     ya, yb = min(y1, y2), max(y1, y2)
     cuts: List[Tuple[float, float]] = []
     for w in wins:
@@ -351,8 +319,8 @@ def clip_vertical_segment(x: float, y1: float, y2: float, wins: List[Window], DI
             cuts.append((ymin, ymax))
     return _subtract_intervals((ya, yb), cuts)
 
-
 def clip_horizontal_segment(y: float, x1: float, x2: float, wins: List[Window], DISTF: float, eps: float = 1e-9) -> List[Tuple[float, float]]:
+    # border-safe: taglio solo se la linea passa "dentro" (strict) la proiezione Y della finestra gonfiata
     xa, xb = min(x1, x2), max(x1, x2)
     cuts: List[Tuple[float, float]] = []
     for w in wins:
@@ -367,7 +335,6 @@ def clip_horizontal_segment(y: float, x1: float, x2: float, wins: List[Window], 
 # ============================================================
 def _k(v: float, nd: int = 6) -> float:
     return round(float(v), nd)
-
 
 def split_segments_at_intersections(
     v_segs: List[Tuple[float, float, float]],
@@ -417,7 +384,6 @@ def split_segments_at_intersections(
 
     return edges, adj
 
-
 def prune_dangling(
     edges: List[Tuple[Tuple[float, float], Tuple[float, float], str]],
     adj: Dict[Tuple[float, float], set],
@@ -448,7 +414,6 @@ def prune_dangling(
 
     return alive
 
-
 def merge_atomic_edges(
     edges: List[Tuple[Tuple[float, float], Tuple[float, float], str]],
     alive: List[bool],
@@ -472,7 +437,6 @@ def merge_atomic_edges(
     v_by_x = defaultdict(list)
     for x, y1, y2 in v_parts:
         v_by_x[x].append((y1, y2))
-
     v_out = []
     for x, lst in v_by_x.items():
         lst = sorted(lst)
@@ -488,7 +452,6 @@ def merge_atomic_edges(
     h_by_y = defaultdict(list)
     for y, x1, x2 in h_parts:
         h_by_y[y].append((x1, x2))
-
     h_out = []
     for y, lst in h_by_y.items():
         lst = sorted(lst)
@@ -503,7 +466,6 @@ def merge_atomic_edges(
 
     return v_out, h_out
 
-
 def prune_vh_segments(
     Xall: List[float],
     Yall: List[float],
@@ -514,19 +476,15 @@ def prune_vh_segments(
     nd: int = 6,
 ) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]:
     protected = set()
-
     Xbase_set = {_k(x, nd) for x in Xbase}
     Ybase_set = {_k(y, nd) for y in Ybase}
-
     xmin, xmax = _k(min(Xall), nd), _k(max(Xall), nd)
     ymin, ymax = _k(min(Yall), nd), _k(max(Yall), nd)
-
     for x in Xall:
         for y in Yall:
             xx, yy = _k(x, nd), _k(y, nd)
             if (xx in Xbase_set) or (yy in Ybase_set) or (xx in (xmin, xmax)) or (yy in (ymin, ymax)):
                 protected.add((xx, yy))
-
     edges, adj = split_segments_at_intersections(v_segs, h_segs, nd=nd)
     alive = prune_dangling(edges, adj, protected_nodes=protected)
     v2, h2 = merge_atomic_edges(edges, alive, nd=nd)
@@ -553,7 +511,6 @@ def diagonali_rigidezze(
     Ystr.sort()
 
     pannelli = defaultdict(list)
-
     for ix in range(len(Xall) - 1):
         for iy in range(len(Yall) - 1):
             x1, x2 = Xall[ix], Xall[ix + 1]
@@ -564,7 +521,7 @@ def diagonali_rigidezze(
             i = bisect.bisect_right(Ystr, y1) - 1
             b_h = x2 - x1
             L = math.hypot(x2 - x1, y2 - y1)
-            k = EA * (b_h * 10) / ((L * 10) * (L * 10))  # cm->mm
+            k = EA * (b_h * 10) / ((L * 10) * (L * 10))
             pannelli[(i, j)].append((y1, x1, k))
 
     rig: Dict[Tuple[int, int], List[List[float]]] = {}
@@ -612,6 +569,7 @@ def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines:
     if w_img > W - 2 * cm:
         w_img = W - 2 * cm
         h_img = w_img * ih / iw
+
     c.drawImage(img, (W - w_img) / 2, H - h1 - h_img - 0.5 * cm, w_img, h_img)
 
     c.setFont(FONT_REG, 10)
@@ -625,7 +583,6 @@ def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines:
 
     _footer(c, W, H)
     c.save()
-
 
 def _extra_pages(
     matrices: Dict[Tuple[int, int], "pd.DataFrame"],
@@ -644,14 +601,12 @@ def _extra_pages(
         c.setFont("Helvetica-Oblique", 9)
         c.drawString(MARGX, y0, "Calcolo rigidezze equivalenti – riepilogo formule")
         y = y0 - 12
-
         eqs = [
             r"$K_{d,i}= \dfrac{E\,A}{L_i^{2}}\,b_i$",
             r"$K_{\text{or}}= \dfrac{1}{\sum K_{d,i,x}}$",
             r"$K_{\text{eq}}= \dfrac{1}{\sum K_{\text{or}}}$",
             r"$A_{\text{eq}}= \dfrac{K_{\text{eq}}\,l^{2}}{E\,b}$",
         ]
-
         for eq in eqs:
             buf = BytesIO()
             fig = plt.figure(figsize=(0.01, 0.01))
@@ -661,13 +616,11 @@ def _extra_pages(
             fig.savefig(buf, format="png", dpi=300, bbox_inches="tight", pad_inches=0.02, transparent=True)
             plt.close(fig)
             buf.seek(0)
-
             img = ImageReader(buf)
             iw, ih = img.getSize()
             scale = 0.5
             c.drawImage(img, MARGX, y - ih * scale, iw * scale, ih * scale, mask="auto")
             y -= ih * scale + 2
-
         return y
 
     top_y = H - 1.6 * cm
@@ -677,7 +630,6 @@ def _extra_pages(
         df = matrices[(i, j)]
         lines = df.to_string().splitlines()
         blocco_h = (len(lines) + 3) * 0.32 * cm
-
         if y - blocco_h < 2 * cm:
             _footer(c, W, H)
             c.showPage()
@@ -700,7 +652,6 @@ def _extra_pages(
         c.setFillColor(colors.black)
 
     testo = _wrap(f"Aunivoca = {area_uni:.0f} mm²", 80)
-
     if y - 2 * cm < 2 * cm:
         _footer(c, W, H)
         c.showPage()
@@ -710,7 +661,6 @@ def _extra_pages(
     c.setFillColor(colors.blue)
     c.drawString(MARGX, y, "Calcolo Area Equivalente univoca")
     y -= 0.45 * cm
-
     c.setFont(FONT_BOLD, 9)
     c.setFillColor(colors.red)
     for ln in testo.splitlines():
@@ -745,21 +695,9 @@ def _extra_pages(
 # ============================================================
 # DXF EXPORT
 # ============================================================
-def _export_dxf(
-    cols,
-    beams,
-    finestre,
-    X,
-    Y,
-    *,
-    DISTF: int,
-    Xbase: List[float],
-    Ybase: List[float],
-    path: Path,
-) -> bool:
+def _export_dxf(cols, beams, finestre, X, Y, *, DISTF: int, Xbase: List[float], Ybase: List[float], path: Path) -> bool:
     if ezdxf is None:
         return False
-
     doc = ezdxf.new(setup=True)
     m = doc.modelspace()
     doc.layers.new("Struttura", dxfattribs={"color": 1})
@@ -841,8 +779,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     PASSO = max(1, PASSO)
     CLEAR = max(5, CLEAR)
-    DISTF = max(10, DISTF)  # come prima (min 10)
-
+    DISTF = max(0, DISTF)  # gonfiatura può essere anche 0
     EA = E * A
 
     grid = payload["grid"]
@@ -861,7 +798,6 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     _must(len(intC) == np_, "columns.interassi_cm deve avere lunghezza np")
     _must(all(v > 0 for v in spB + intB + spC + intC), "spessori/interassi devono essere >0")
 
-    # assi travi/pilastri (cm)
     y = [0.0]
     for v in intB:
         y.append(y[-1] + v)
@@ -872,8 +808,15 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     beams = [Beam(yy, sp) for yy, sp in zip(y, spB)]
     cols = [Column(xx, sp) for xx, sp in zip(x, spC)]
 
-    # finestre: dx,dy rispetto all'ASSE pilastro sx e trave inf del pannello
     win_data: Dict[Tuple[int, int], List[Window]] = defaultdict(list)
+
+    export = payload.get("export", {})
+    export_png = bool(export.get("png", False))
+    export_pdf = bool(export.get("pdf", False))
+    export_dxf = bool(export.get("dxf", False))
+
+    # --- VALIDAZIONE FINESTRE: SOLO "reale" (NO gonfiatura, NO CLEAR) ---
+    EPSG = 1e-9
 
     for item in payload.get("openings", []):
         i = int(item["panel"]["i"])
@@ -889,26 +832,34 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             _must(ww > 0 and hh > 0, "w/h finestra devono essere >0")
 
             x_pil_sx = cols[j].x_axis
+            x_pil_dx = cols[j + 1].x_axis
             y_trave_inf = beams[i].y_axis
+            y_trave_sup = beams[i + 1].y_axis
 
+            sp_pil_sx = cols[j].spess
+            sp_pil_dx = cols[j + 1].spess
+            sp_tr_inf = beams[i].spess
+            sp_tr_sup = beams[i + 1].spess
+
+            # finestra reale (rispetto agli assi)
             xa = x_pil_sx + dx
             ya = y_trave_inf + dy
             xb = xa + ww
             yb = ya + hh
 
-            xmin = cols[j].x_axis - cols[j].spess / 2 + CLEAR
-            xmax = cols[j + 1].x_axis + cols[j + 1].spess / 2 - CLEAR
-            ymin = beams[i].y_axis + beams[i].spess / 2 + CLEAR
-            ymax = beams[i + 1].y_axis - beams[i + 1].spess / 2 - CLEAR
+            # limiti reali del pannello (facce interne degli elementi strutturali)
+            xmin = x_pil_sx + sp_pil_sx / 2.0
+            xmax = x_pil_dx - sp_pil_dx / 2.0
+            ymin = y_trave_inf + sp_tr_inf / 2.0
+            ymax = y_trave_sup - sp_tr_sup / 2.0
 
             _must(
-                not (xa < xmin or xb > xmax or ya < ymin or yb > ymax),
-                f"Finestra esce dal pannello (i={i}, j={j}).",
+                not (xa < xmin - EPSG or xb > xmax + EPSG or ya < ymin - EPSG or yb > ymax + EPSG),
+                f"Finestra esce dal pannello (i={i}, j={j})."
             )
 
             win_data[(i, j)].append(Window(x=xa, y_rel=dy, w=ww, h=hh, y_abs=ya))
 
-    export = payload.get("export", {})
     return {
         "job_id": job_id,
         "meta_norm": {
@@ -917,9 +868,9 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "suffix": suffix,
             "wall_orientation": wall_orientation,
         },
-        "export_png": bool(export.get("png", False)),
-        "export_pdf": bool(export.get("pdf", False)),
-        "export_dxf": bool(export.get("dxf", False)),
+        "export_png": export_png,
+        "export_pdf": export_pdf,
+        "export_dxf": export_dxf,
         "PASSO": PASSO,
         "CLEAR": CLEAR,
         "DISTF": DISTF,
@@ -935,7 +886,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# OVERLAY HELPERS (JSON overlay per Lovable)
+# OVERLAY HELPERS
 # ============================================================
 def _line(a, b, layer, stroke="#111", width=1, dash=None, panel=None):
     return {
@@ -946,7 +897,6 @@ def _line(a, b, layer, stroke="#111", width=1, dash=None, panel=None):
         **({"panel": panel} if panel is not None else {}),
         "style": {"stroke": stroke, "width": width, "dash": dash or []},
     }
-
 
 def _text(pos, text, layer="label", fill="#111", size=10, panel=None):
     return {
@@ -964,7 +914,6 @@ def _text(pos, text, layer="label", fill="#111", size=10, panel=None):
 # ============================================================
 def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     cfg = parse_payload(payload)
-
     PASSO, CLEAR, DISTF = cfg["PASSO"], cfg["CLEAR"], cfg["DISTF"]
     E, EA = cfg["E"], cfg["EA"]
     cols: List[Column] = cfg["cols"]
@@ -972,44 +921,52 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     win_data: Dict[Tuple[int, int], List[Window]] = cfg["win_data"]
     all_w = [w for lst in win_data.values() for w in lst]
 
-    # 1) primarie
+    # primarie
     Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO, CLEAR=CLEAR)
     Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO, CLEAR=CLEAR)
 
-    # 2) linee "a fianco" finestre, considerando finestra gonfiata (DISTF)
-    Xfin = linee_finestre(Xfull, all_w, "x", DISTF=DISTF)
-    Yfin = linee_finestre(Yfull, all_w, "y", DISTF=DISTF)
+    # finestre gonfiate (DISTF) SOLO per generazione griglia/clipping/diagonali
+    all_w_infl = inflate_windows(all_w, DISTF)
 
-    # filtro extra globale (bordo ok)
-    Xfin = sorted(set(x for x in Xfin if _ok_axis_value_global(x, all_w, "x", DISTF)))
-    Yfin = sorted(set(y for y in Yfin if _ok_axis_value_global(y, all_w, "y", DISTF)))
+    # linee vicino finestre: calcolate usando finestra gonfiata e DISTF=0 (no doppio inflate)
+    Xfin = linee_finestre(Xfull, all_w_infl, "x")
+    Yfin = linee_finestre(Yfull, all_w_infl, "y")
 
-    # 3) intermedie 100/75/50/25
+    # filtro globale SOLO X (Y no)
+    EPS = 1e-9
+    def _inside_any_x(x: float) -> bool:
+        return any((w.x + EPS) < x < (w.x + w.w - EPS) for w in all_w_infl)
+
+    Xfin = sorted(set(x for x in Xfin if not _inside_any_x(x)))
+    Yfin = sorted(set(Yfin))
+
+    # intermedie
     Xsec = intermedie(sorted(set(Xbase + Xfin)), PASSO=PASSO)
     Ysec = intermedie(sorted(set(Ybase + Yfin)), PASSO=PASSO)
 
     Xall = sorted(set(Xbase + Xfin + Xsec))
     Yall = sorted(set(Ybase + Yfin + Ysec))
 
-    # 4) V/H raw con clipping (DISTF) + prune trattini
+    # V/H raw (clipping su finestre gonfiate via DISTF=0 perché sono già inflate)
     v_raw: List[Tuple[float, float, float]] = []
     h_raw: List[Tuple[float, float, float]] = []
 
     for y in Yall:
         for x1, x2 in zip(Xall[:-1], Xall[1:]):
-            for xa, xb in clip_horizontal_segment(y, x1, x2, all_w, DISTF=DISTF):
+            for xa, xb in clip_horizontal_segment(y, x1, x2, all_w_infl, DISTF=0):
                 if xb > xa:
                     h_raw.append((y, xa, xb))
 
     for x in Xall:
         for y1, y2 in zip(Yall[:-1], Yall[1:]):
-            for ya, yb in clip_vertical_segment(x, y1, y2, all_w, DISTF=DISTF):
+            for ya, yb in clip_vertical_segment(x, y1, y2, all_w_infl, DISTF=0):
                 if yb > ya:
                     v_raw.append((x, ya, yb))
 
+    # prune trattini
     v_segs, h_segs = prune_vh_segments(Xall, Yall, Xbase, Ybase, v_raw, h_raw, nd=6)
 
-    # 5) stats (V/H pruned)
+    # stats (V/H pruned, diagonali)
     Lh_cm = sum(x2 - x1 for (y, x1, x2) in h_segs)
     Lv_cm = sum(y2 - y1 for (x, y1, y2) in v_segs)
     n_o = len(h_segs)
@@ -1022,10 +979,10 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             a, b = Xall[i], Xall[i + 1]
             c_, d_ = Yall[j], Yall[j + 1]
             dlen = math.hypot(b - a, d_ - c_)
-            if ok_seg(a, c_, b, d_, all_w, DISTF=DISTF):
+            if ok_seg(a, c_, b, d_, all_w_infl, DISTF=0):
                 n_d += 1
                 Ld_cm += dlen
-            if ok_seg(a, d_, b, c_, all_w, DISTF=DISTF):
+            if ok_seg(a, d_, b, c_, all_w_infl, DISTF=0):
                 n_d += 1
                 Ld_cm += dlen
 
@@ -1051,31 +1008,15 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     ]
 
     stats_table = {
-        "orizzontali": {
-            "L_m": float(round(Lh_cm / 100.0, 4)),
-            "n": int(n_o),
-            "inc_p": float(round(inc(n_o, area_pieno_m2), 4)),
-            "inc_t": float(round(inc(n_o, area_tot_m2), 4)),
-        },
-        "verticali": {
-            "L_m": float(round(Lv_cm / 100.0, 4)),
-            "n": int(n_v),
-            "inc_p": float(round(inc(n_v, area_pieno_m2), 4)),
-            "inc_t": float(round(inc(n_v, area_tot_m2), 4)),
-        },
-        "diagonali": {
-            "L_m": float(round(Ld_cm / 100.0, 4)),
-            "n": int(n_d),
-            "n_x2": float(round(n_d / 2.0, 4)),
-            "inc_p": float(round(inc(n_d, area_pieno_m2), 4)),
-            "inc_t": float(round(inc(n_d, area_tot_m2), 4)),
-        },
+        "orizzontali": {"L_m": float(round(Lh_cm / 100.0, 4)), "n": int(n_o), "inc_p": float(round(inc(n_o, area_pieno_m2), 4)), "inc_t": float(round(inc(n_o, area_tot_m2), 4))},
+        "verticali": {"L_m": float(round(Lv_cm / 100.0, 4)), "n": int(n_v), "inc_p": float(round(inc(n_v, area_pieno_m2), 4)), "inc_t": float(round(inc(n_v, area_tot_m2), 4))},
+        "diagonali": {"L_m": float(round(Ld_cm / 100.0, 4)), "n": int(n_d), "n_x2": float(round(n_d / 2.0, 4)), "inc_p": float(round(inc(n_d, area_pieno_m2), 4)), "inc_t": float(round(inc(n_d, area_tot_m2), 4))},
         "passo_medio_cm": float(round(p_medio, 3)),
         "area_pieno_m2": float(round(area_pieno_m2, 6)),
         "area_tot_m2": float(round(area_tot_m2, 6)),
     }
 
-    # 6) stiffness (diagonali_rigidezze usa ok_seg con DISTF)
+    # stiffness
     rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w, EA=EA, CLEAR=CLEAR, DISTF=DISTF)
 
     Aeq_dict: Dict[Tuple[int, int], float] = {}
@@ -1085,7 +1026,6 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     for (i, j), mat in rig.items():
         df = pd.DataFrame(reversed(mat)).round(0).astype(int)
-
         df_tmp = df.copy()
         df_tmp["Kor"] = df_tmp.apply(lambda row: 1 / (row.sum()) if row.sum() else 0.0, axis=1)
         K_eq = 1 / df_tmp["Kor"].sum() if df_tmp["Kor"].sum() else 0.0
@@ -1093,7 +1033,6 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         Lx = cols[j + 1].x_axis - cols[j].x_axis
         Ly = beams[i + 1].y_axis - beams[i].y_axis
         Ld_mm = math.hypot(Lx * 10, Ly * 10)
-
         Aeq = (K_eq * (Ld_mm**2) / (Lx * 10) / E) if (K_eq > 0 and Lx > 0) else 0.0
         Kad = ((E * (Lx * 10)) / (Ld_mm**2)) if Ld_mm > 0 else 0.0
 
@@ -1105,7 +1044,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         df_pdf["Kor"] = df_tmp["Kor"].map(lambda v: f"{v:.2e}")
         matrices_for_pdf[(i, j)] = df_pdf
 
-    # 7) univoca
+    # univoca
     s_keq = pd.Series(Keq_dict, name="Keq")
     s_keq.index = pd.MultiIndex.from_tuples(s_keq.index, names=["i_trave", "j_pilastro"])
     df_keq = s_keq.unstack(level="j_pilastro").sort_index(axis=0, ascending=False).fillna(0.0)
@@ -1120,32 +1059,30 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     Aeq_univoca = (K_eq_u / K_eq_u_adi) if K_eq_u_adi else 0.0
 
-    # 8) overlays (grid = V/H pruned + diagonali da ok_seg)
+    # overlays
     grid_entities = []
     for x, y1, y2 in v_segs:
         grid_entities.append(_line((x, y1), (x, y2), layer="grid_v"))
     for y, x1, x2 in h_segs:
         grid_entities.append(_line((x1, y), (x2, y), layer="grid_h"))
-
     for ii in range(len(Xall) - 1):
         for jj in range(len(Yall) - 1):
             a, b = Xall[ii], Xall[ii + 1]
             c_, d_ = Yall[jj], Yall[jj + 1]
-            if ok_seg(a, c_, b, d_, all_w, DISTF=DISTF):
+            if ok_seg(a, c_, b, d_, all_w_infl, DISTF=0):
                 grid_entities.append(_line((a, c_), (b, d_), layer="grid_d"))
-            if ok_seg(a, d_, b, c_, all_w, DISTF=DISTF):
+            if ok_seg(a, d_, b, c_, all_w_infl, DISTF=0):
                 grid_entities.append(_line((a, d_), (b, c_), layer="grid_d"))
 
     aeq_entities, uni_entities = [], []
-    for (i, j), Aeq in Aeq_dict.items():
+    for (i, j), Aeqv in Aeq_dict.items():
         xL, xR = cols[j].x_axis, cols[j + 1].x_axis
         yB, yT = beams[i].y_axis, beams[i + 1].y_axis
         pid = f"{i},{j}"
-
         aeq_entities.append(_line((xL, yB), (xR, yT), layer="diag_eq", stroke="#d00", width=2, dash=[6, 4], panel=pid))
         aeq_entities.append(_line((xL, yT), (xR, yB), layer="diag_eq", stroke="#d00", width=2, dash=[6, 4], panel=pid))
         xc, yc = (xL + xR) / 2, (yB + yT) / 2
-        aeq_entities.append(_text((xc + 3, yc + 2), f"Aeq={Aeq:.0f} mm²", fill="#d00", size=10, panel=pid))
+        aeq_entities.append(_text((xc + 3, yc + 2), f"Aeq={Aeqv:.0f} mm²", fill="#d00", size=10, panel=pid))
 
         uni_entities.append(_line((xL, yB), (xR, yT), layer="diag_uni", stroke="#0a0", width=2, dash=[6, 4], panel=pid))
         uni_entities.append(_line((xL, yT), (xR, yB), layer="diag_uni", stroke="#0a0", width=2, dash=[6, 4], panel=pid))
@@ -1161,9 +1098,9 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     panels = []
     nt = len(beams) - 1
-    np_ = len(cols) - 1
+    np__ = len(cols) - 1
     for i in range(nt):
-        for j in range(np_):
+        for j in range(np__):
             xL, xR = cols[j].x_axis, cols[j + 1].x_axis
             yB, yT = beams[i].y_axis, beams[i + 1].y_axis
             pid = f"{i},{j}"
@@ -1196,11 +1133,10 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "Aeq_univoca_mm2": float(round(Aeq_univoca, 2)),
             "Aeq_by_panel_mm2": {f"{i},{j}": v for (i, j), v in Aeq_dict.items()},
             "Keq_by_panel_N_per_mm": {f"{i},{j}": v for (i, j), v in Keq_dict.items()},
-            "stats": stats,            # invariato
-            "stats_table": stats_table # aggiunto
+            "stats": stats,              # invariato
+            "stats_table": stats_table,  # aggiunto
         },
         "overlays": overlays,
-        # internals only for export
         "internals": {
             "Xall": Xall,
             "Yall": Yall,
@@ -1223,14 +1159,11 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 # EXPORTS TO DIRECTORY (TEMP) + ZIP IN RAM
 # ============================================================
 def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out_dir: Path) -> Dict[str, Optional[Path]]:
-    """
-    Scrive i file in out_dir (temporanea), poi l'endpoint /export li zippa in RAM.
-    """
     cfg = parse_payload(payload)
-
     export_png = cfg["export_png"]
     export_pdf = cfg["export_pdf"]
     export_dxf = cfg["export_dxf"]
+
     if not (export_png or export_pdf or export_dxf):
         export_png = export_pdf = export_dxf = True
 
@@ -1248,7 +1181,6 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
     matrices_for_pdf = computed["internals"]["matrices_for_pdf"]
     Aeq_dict = computed["internals"]["Aeq_dict"]
     Keq_dict = computed["internals"]["Keq_dict"]
-
     v_segs = computed["internals"].get("v_segs_pruned", [])
     h_segs = computed["internals"].get("h_segs_pruned", [])
 
@@ -1268,14 +1200,12 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
     header_lines = [
         f"Project: {meta_norm['project_name']}",
         f"Location: {meta_norm['location_name']}",
-        f"Wall: {meta_norm['wall_orientation']}  |  Suffix: {meta_norm['suffix']}",
+        f"Wall: {meta_norm['wall_orientation']} | Suffix: {meta_norm['suffix']}",
     ]
 
     written: Dict[str, Optional[Path]] = {"schema_png": None, "grafico1_png": None, "grafico2_png": None, "pdf_final": None, "dxf": None}
 
-    # --- PNG (serve anche per PDF) ---
     if export_png or export_pdf:
-
         def base_axes(ax):
             x_min = cols[0].x_axis - cols[0].spess / 2
             x_max = cols[-1].x_axis + cols[-1].spess / 2
@@ -1295,7 +1225,6 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             ax.set_ylabel("Y [cm]")
             ax.grid(True)
 
-        # schema posa (usa V/H pruned)
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
@@ -1308,36 +1237,35 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         for y, x1, x2 in h_segs:
             ax.plot([x1, x2], [y, y], "k", lw=0.7)
 
+        all_w_infl = inflate_windows(all_w, DISTF)
         for i in range(len(Xall) - 1):
             for j in range(len(Yall) - 1):
                 a, b = Xall[i], Xall[i + 1]
                 c_, d_ = Yall[j], Yall[j + 1]
-                if ok_seg(a, c_, b, d_, all_w, DISTF=DISTF):
+                if ok_seg(a, c_, b, d_, all_w_infl, DISTF=0):
                     ax.plot([a, b], [c_, d_], "k", lw=0.7)
-                if ok_seg(a, d_, b, c_, all_w, DISTF=DISTF):
+                if ok_seg(a, d_, b, c_, all_w_infl, DISTF=0):
                     ax.plot([a, b], [d_, c_], "k", lw=0.7)
 
         fig.tight_layout()
         fig.savefig(schema_png, dpi=300)
         plt.close(fig)
 
-        # Aeq per pannello
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
         ax.set_title("Diagonali equivalenti – Aeq per pannello")
-        for (i, j), Aeq in Aeq_dict.items():
+        for (i, j), Aeqv in Aeq_dict.items():
             xL, xR = cols[j].x_axis, cols[j + 1].x_axis
             yB, yT = beams[i].y_axis, beams[i + 1].y_axis
             ax.plot([xL, xR], [yB, yT], "r--", lw=1.2)
             ax.plot([xL, xR], [yT, yB], "r--", lw=1.2)
             xc, yc = (xL + xR) / 2, (yB + yT) / 2
-            ax.text(xc + 3, yc + 2, f"Aeq={Aeq:.0f} mm²", fontsize=8, color="red")
+            ax.text(xc + 3, yc + 2, f"Aeq={Aeqv:.0f} mm²", fontsize=8, color="red")
         fig.tight_layout()
         fig.savefig(grafico1_png, dpi=300)
         plt.close(fig)
 
-        # Aeq univoca
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
@@ -1358,26 +1286,24 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             written["grafico1_png"] = grafico1_png
             written["grafico2_png"] = grafico2_png
 
-    # --- PDF ---
-    if export_pdf:
-        _first_page(schema_png, stats, first_pdf, header_lines=header_lines)
-        _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
+        if export_pdf:
+            _first_page(schema_png, stats, first_pdf, header_lines=header_lines)
+            _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
 
-        merged = False
-        if PdfWriter is not None:
-            wr = PdfWriter()
-            for p in PdfReader(str(first_pdf)).pages:
-                wr.add_page(p)
-            for p in PdfReader(str(extra_pdf)).pages:
-                wr.add_page(p)
-            with final_pdf.open("wb") as f:
-                wr.write(f)
-            merged = True
+            merged = False
+            if PdfWriter is not None:
+                wr = PdfWriter()
+                for p in PdfReader(str(first_pdf)).pages:
+                    wr.add_page(p)
+                for p in PdfReader(str(extra_pdf)).pages:
+                    wr.add_page(p)
+                with final_pdf.open("wb") as f:
+                    wr.write(f)
+                merged = True
 
-        if merged:
-            written["pdf_final"] = final_pdf
+            if merged:
+                written["pdf_final"] = final_pdf
 
-    # --- DXF ---
     if export_dxf:
         dxf_ok = _export_dxf(cols, beams, all_w, Xall, Yall, DISTF=DISTF, Xbase=Xbase, Ybase=Ybase, path=dxf_path)
         if dxf_ok:
@@ -1393,15 +1319,10 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 def health():
     return {"ok": True}
 
-
 @app.post("/preview")
 def preview(payload: Payload):
-    """
-    Preview: calcola e ritorna JSON (overlays inclusi), NON genera file.
-    """
     try:
         data = payload.root
-        # forza export off in preview
         data = {**data, "export": {"png": False, "pdf": False, "dxf": False}}
         computed = compute(data)
         computed.pop("internals", None)
@@ -1409,13 +1330,8 @@ def preview(payload: Payload):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
 @app.post("/export")
 def export(payload: Payload):
-    """
-    Export: genera PDF/PNG/DXF in cartella temporanea, zippa in RAM e risponde direttamente con lo ZIP.
-    NESSUN salvataggio persistente richiesto.
-    """
     try:
         data = payload.root
         computed = compute(data)
@@ -1430,10 +1346,9 @@ def export(payload: Payload):
                 for p in sorted(out_dir.glob(f"{job_id}_*")):
                     if p.is_file():
                         z.write(p, arcname=p.name)
-
             mem.seek(0)
-            filename = f"{job_id}_allegati.zip"
 
+            filename = f"{job_id}_allegati.zip"
             return StreamingResponse(
                 mem,
                 media_type="application/zip",
