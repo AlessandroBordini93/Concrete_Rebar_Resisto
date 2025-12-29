@@ -9,6 +9,11 @@
 # - Filtro globale SOLO X per Xfin; Yfin senza filtro globale
 # - Border-safe per ok_seg + clipping
 # - Prune “trattini” V/H
+#
+# MOD DI OGGI (SOLO STATISTICHE):
+# - n_o e n_v calcolati come "tratti atomici" (split ai nodi/intersezioni) dopo prune
+# - passo medio = media dei passi tra linee Xall e Yall (no mediana)
+# - diagonali invariati
 
 from __future__ import annotations
 
@@ -1031,12 +1036,31 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     # prune trattini
     v_segs, h_segs = prune_vh_segments(Xall, Yall, Xbase, Ybase, v_raw, h_raw, nd=6)
 
-    # stats (V/H pruned, diagonali)
+    # ============================================================
+    # STATS (MODIFICATO SOLO QUI)
+    #
+    # Prima:
+    #   n_o = len(h_segs) / n_v = len(v_segs) -> sbagliato perché h_segs/v_segs sono MERGED
+    #   p_medio = (Lv/nv + Lh/no)/2 -> non è "passo", è "lunghezza media segmento"
+    #
+    # Ora:
+    #   - Lh/Lv = somma delle lunghezze dei segmenti pruned (coerente col disegno)
+    #   - n_o/n_v = numero dei TRATTI ATOMICI tra intersezioni (split dopo prune)
+    #   - passo medio = media dei passi tra linee consecutive in Xall e Yall (no mediana)
+    #
+    # Diagonali: invariato (per-cella) perché ti torna già giusto.
+    # ============================================================
+
+    # 1) Lunghezze totali V/H (coerenti col disegno finale)
     Lh_cm = sum(x2 - x1 for (y, x1, x2) in h_segs)
     Lv_cm = sum(y2 - y1 for (x, y1, y2) in v_segs)
-    n_o = len(h_segs)
-    n_v = len(v_segs)
 
+    # 2) Conteggi "elementi" V/H come tratti atomici tra intersezioni
+    edges_atomic, _adj_atomic = split_segments_at_intersections(v_segs, h_segs, nd=6)
+    n_o = sum(1 for (_u, _v, t) in edges_atomic if t == "h")
+    n_v = sum(1 for (_u, _v, t) in edges_atomic if t == "v")
+
+    # 3) Diagonali: INVARIATO (per cella)
     Ld_cm = 0.0
     n_d = 0
     for i in range(len(Xall) - 1):
@@ -1051,6 +1075,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
                 n_d += 1
                 Ld_cm += dlen
 
+    # 4) Aree: invariato
     width_cm = cols[-1].x_axis
     height_cm = beams[-1].y_axis - beams[0].y_axis
     area_tot_m2 = (width_cm * height_cm) / 10_000
@@ -1060,7 +1085,10 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     def inc(n, a):
         return n / 2.75 / a
 
-    p_medio = ((Lv_cm / n_v) + (Lh_cm / n_o)) / 2 if (n_v and n_o) else 0.0
+    # 5) Passo medio: media semplice dei passi tra linee consecutive (Xall/Yall)
+    dx = [Xall[k + 1] - Xall[k] for k in range(len(Xall) - 1)]
+    dy = [Yall[k + 1] - Yall[k] for k in range(len(Yall) - 1)]
+    p_medio = ((sum(dx) / len(dx)) + (sum(dy) / len(dy))) / 2 if (dx and dy) else 0.0
 
     stats = [
         f"Orizzontali : L = {Lh_cm/100:.2f} m | n = {n_o} | Inc. P {inc(n_o,area_pieno_m2):.2f} T {inc(n_o,area_tot_m2):.2f}",
