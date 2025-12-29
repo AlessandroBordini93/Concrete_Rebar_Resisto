@@ -1,12 +1,14 @@
 # app.py — RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
-# MOD:
-# 1) DISTF = "finestra gonfiata" SOLO per: linee vicino finestra + clipping V/H + ok_seg + diagonali
-# 2) Xfin: filtro globale (se cade dentro QUALSIASI finestra gonfiata -> eliminata)  ✅ SOLO X
-#    Yfin: NO filtro globale (finestre affiancate in X ma non in Y) ✅
-# 3) ok_seg + clip_*: contatto sul bordo NON è intersezione/taglio (border-safe)
-# 4) parse_payload: validazione finestre fatta su FINESTRA REALE (non gonfiata),
-#    con vincolo dx>=spess_pil_sx/2 e dy>=spess_trave_inf/2 (misure rispetto agli assi)
-# 5) JSON: aggiunto results.stats_table (senza toccare results.stats)
+# MOD (ultima miglioria):
+# - DISTF = "finestra gonfiata", ma la gonfiatura viene CLAMPATA (tagliata) per rimanere
+#   SEMPRE dentro lo specchio murario del pannello (tra facce interne di pilastri e travi).
+#   Quindi: dove posso aggiungo DISTF; dove non posso aggiungo il massimo possibile.
+#
+# Rimane invariato:
+# - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
+# - Filtro globale SOLO X per Xfin; Yfin senza filtro globale
+# - Border-safe per ok_seg + clipping
+# - Prune “trattini” V/H
 
 from __future__ import annotations
 
@@ -55,7 +57,10 @@ except ImportError:
 # CONFIG
 # ============================================================
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
-app = FastAPI(title="RebarCA API", version="2.2 (zip-on-the-fly, stats_table, x-only-filter, border-safe, window-real-validate)")
+app = FastAPI(
+    title="RebarCA API",
+    version="2.3 (zip-on-the-fly, stats_table, x-only-filter, border-safe, window-real-validate, distf-clamped-to-panel)",
+)
 
 class Payload(RootModel[Dict[str, Any]]):
     pass
@@ -197,30 +202,76 @@ def primarie(nodes, *, vertical: bool, PASSO: int, CLEAR: int):
     base = []
     for n in nodes:
         a, sp = (n.x_axis, n.spess) if vertical else (n.y_axis, n.spess)
-        base.append(
-            min((v for v in full if a - sp / 2 + CLEAR <= v <= a + sp / 2 - CLEAR), key=lambda v: abs(v - a))
-        )
+        base.append(min((v for v in full if a - sp / 2 + CLEAR <= v <= a + sp / 2 - CLEAR), key=lambda v: abs(v - a)))
     return full, base
 
-def inflate_windows(wins: List[Window], DISTF: float) -> List[Window]:
+
+# ============================================================
+# DISTF CLAMPED (finestra gonfiata ma sempre dentro pannello)
+# ============================================================
+def inflate_window_clamped_to_panel(
+    w: Window,
+    i: int,
+    j: int,
+    cols: List[Column],
+    beams: List[Beam],
+    DISTF: float,
+    eps: float = 1e-9,
+) -> Window:
     if DISTF <= 0:
-        return wins
+        return w
+
+    # facce interne pannello (specchio murario)
+    xmin = cols[j].x_axis + cols[j].spess / 2.0
+    xmax = cols[j + 1].x_axis - cols[j + 1].spess / 2.0
+    ymin = beams[i].y_axis + beams[i].spess / 2.0
+    ymax = beams[i + 1].y_axis - beams[i + 1].spess / 2.0
+
+    xa = w.x
+    ya = w.y_abs
+    xb = w.x + w.w
+    yb = w.y_abs + w.h
+
+    # quanto "spazio" ho prima di uscire dal pannello
+    pad_l = max(0.0, min(DISTF, xa - xmin))
+    pad_r = max(0.0, min(DISTF, xmax - xb))
+    pad_b = max(0.0, min(DISTF, ya - ymin))
+    pad_t = max(0.0, min(DISTF, ymax - yb))
+
+    # se per qualche motivo siamo quasi sul bordo (numerica), clampo duro
+    if xa - pad_l < xmin - eps:
+        pad_l = max(0.0, xa - xmin)
+    if xb + pad_r > xmax + eps:
+        pad_r = max(0.0, xmax - xb)
+    if ya - pad_b < ymin - eps:
+        pad_b = max(0.0, ya - ymin)
+    if yb + pad_t > ymax + eps:
+        pad_t = max(0.0, ymax - yb)
+
+    return Window(
+        x=xa - pad_l,
+        y_rel=w.y_rel,  # non usato nel calcolo geometrico (solo info)
+        w=w.w + pad_l + pad_r,
+        h=w.h + pad_b + pad_t,
+        y_abs=ya - pad_b,
+    )
+
+def build_inflated_windows_clamped(
+    win_data: Dict[Tuple[int, int], List[Window]],
+    cols: List[Column],
+    beams: List[Beam],
+    DISTF: float,
+) -> List[Window]:
     out: List[Window] = []
-    for w in wins:
-        out.append(
-            Window(
-                x=w.x - DISTF,
-                y_rel=w.y_rel,
-                w=w.w + 2 * DISTF,
-                h=w.h + 2 * DISTF,
-                y_abs=w.y_abs - DISTF,
-            )
-        )
+    for (i, j), lst in win_data.items():
+        for w in lst:
+            out.append(inflate_window_clamped_to_panel(w, i=i, j=j, cols=cols, beams=beams, DISTF=DISTF))
     return out
+
 
 def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> List[float]:
     """
-    Regola richiesta:
+    Regola:
       - asse="x": scelgo sx/dx per ogni finestra gonfiata, SKIPPANDO candidati che cadono
         dentro QUALSIASI finestra gonfiata (filtro globale X).
       - asse="y": scelgo giù/su per ogni finestra gonfiata, SENZA filtro globale.
@@ -229,7 +280,7 @@ def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> Lis
 
     def ok_axis_value_global_x(x: float) -> bool:
         for w in wins_gonf:
-            if (w.x) < x < (w.x + w.w):  # strict inside
+            if w.x < x < (w.x + w.w):  # strict inside
                 return False
         return True
 
@@ -255,6 +306,7 @@ def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> Lis
         else:
             B = w.y_abs
             T = w.y_abs + w.h
+
             i_giu = bisect.bisect_right(grid, B) - 1
             i_su = bisect.bisect_left(grid, T)
 
@@ -695,9 +747,21 @@ def _extra_pages(
 # ============================================================
 # DXF EXPORT
 # ============================================================
-def _export_dxf(cols, beams, finestre, X, Y, *, DISTF: int, Xbase: List[float], Ybase: List[float], path: Path) -> bool:
+def _export_dxf(
+    cols: List[Column],
+    beams: List[Beam],
+    finestre_real: List[Window],
+    finestre_infl: List[Window],
+    X: List[float],
+    Y: List[float],
+    *,
+    Xbase: List[float],
+    Ybase: List[float],
+    path: Path,
+) -> bool:
     if ezdxf is None:
         return False
+
     doc = ezdxf.new(setup=True)
     m = doc.modelspace()
     doc.layers.new("Struttura", dxfattribs={"color": 1})
@@ -716,7 +780,8 @@ def _export_dxf(cols, beams, finestre, X, Y, *, DISTF: int, Xbase: List[float], 
     for b in beams:
         rect(x_min, b.y_axis - b.spess / 2, x_max, b.y_axis + b.spess / 2)
 
-    for w in finestre:
+    # disegno finestre REALI (non gonfiate)
+    for w in finestre_real:
         rect(w.x, w.y_abs, w.x + w.w, w.y_abs + w.h)
 
     add = lambda a, b: m.add_line(a, b, dxfattribs={"layer": "Resisto"})
@@ -724,15 +789,16 @@ def _export_dxf(cols, beams, finestre, X, Y, *, DISTF: int, Xbase: List[float], 
     v_raw: List[Tuple[float, float, float]] = []
     h_raw: List[Tuple[float, float, float]] = []
 
+    # clipping su finestre gonfiate CLAMPATE (DISTF=0 perché già gonfiate)
     for x in X:
         for y1, y2 in zip(Y[:-1], Y[1:]):
-            for ya, yb in clip_vertical_segment(x, y1, y2, finestre, DISTF=DISTF):
+            for ya, yb in clip_vertical_segment(x, y1, y2, finestre_infl, DISTF=0):
                 if yb > ya:
                     v_raw.append((x, ya, yb))
 
     for y in Y:
         for x1, x2 in zip(X[:-1], X[1:]):
-            for xa, xb in clip_horizontal_segment(y, x1, x2, finestre, DISTF=DISTF):
+            for xa, xb in clip_horizontal_segment(y, x1, x2, finestre_infl, DISTF=0):
                 if xb > xa:
                     h_raw.append((y, xa, xb))
 
@@ -747,9 +813,9 @@ def _export_dxf(cols, beams, finestre, X, Y, *, DISTF: int, Xbase: List[float], 
         for j in range(len(Y) - 1):
             a, b = X[i], X[i + 1]
             c_, d_ = Y[j], Y[j + 1]
-            if ok_seg(a, c_, b, d_, finestre, DISTF=DISTF):
+            if ok_seg(a, c_, b, d_, finestre_infl, DISTF=0):
                 add((a, c_), (b, d_))
-            if ok_seg(a, d_, b, c_, finestre, DISTF=DISTF):
+            if ok_seg(a, d_, b, c_, finestre_infl, DISTF=0):
                 add((a, d_), (b, c_))
 
     doc.saveas(str(path))
@@ -779,7 +845,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     PASSO = max(1, PASSO)
     CLEAR = max(5, CLEAR)
-    DISTF = max(0, DISTF)  # gonfiatura può essere anche 0
+    DISTF = max(0, DISTF)
     EA = E * A
 
     grid = payload["grid"]
@@ -815,7 +881,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     export_pdf = bool(export.get("pdf", False))
     export_dxf = bool(export.get("dxf", False))
 
-    # --- VALIDAZIONE FINESTRE: SOLO "reale" (NO gonfiatura, NO CLEAR) ---
+    # validazione finestre reali nello specchio (NO DISTF, NO CLEAR)
     EPSG = 1e-9
 
     for item in payload.get("openings", []):
@@ -841,13 +907,11 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             sp_tr_inf = beams[i].spess
             sp_tr_sup = beams[i + 1].spess
 
-            # finestra reale (rispetto agli assi)
             xa = x_pil_sx + dx
             ya = y_trave_inf + dy
             xb = xa + ww
             yb = ya + hh
 
-            # limiti reali del pannello (facce interne degli elementi strutturali)
             xmin = x_pil_sx + sp_pil_sx / 2.0
             xmax = x_pil_dx - sp_pil_dx / 2.0
             ymin = y_trave_inf + sp_tr_inf / 2.0
@@ -855,7 +919,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             _must(
                 not (xa < xmin - EPSG or xb > xmax + EPSG or ya < ymin - EPSG or yb > ymax + EPSG),
-                f"Finestra esce dal pannello (i={i}, j={j})."
+                f"Finestra esce dal pannello (i={i}, j={j}).",
             )
 
             win_data[(i, j)].append(Window(x=xa, y_rel=dy, w=ww, h=hh, y_abs=ya))
@@ -916,23 +980,24 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     cfg = parse_payload(payload)
     PASSO, CLEAR, DISTF = cfg["PASSO"], cfg["CLEAR"], cfg["DISTF"]
     E, EA = cfg["E"], cfg["EA"]
+
     cols: List[Column] = cfg["cols"]
     beams: List[Beam] = cfg["beams"]
     win_data: Dict[Tuple[int, int], List[Window]] = cfg["win_data"]
-    all_w = [w for lst in win_data.values() for w in lst]
+    all_w_real = [w for lst in win_data.values() for w in lst]
+
+    # finestre gonfiate CLAMPATE allo specchio murario del pannello
+    all_w_infl = build_inflated_windows_clamped(win_data, cols, beams, DISTF)
 
     # primarie
     Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO, CLEAR=CLEAR)
     Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO, CLEAR=CLEAR)
 
-    # finestre gonfiate (DISTF) SOLO per generazione griglia/clipping/diagonali
-    all_w_infl = inflate_windows(all_w, DISTF)
-
-    # linee vicino finestre: calcolate usando finestra gonfiata e DISTF=0 (no doppio inflate)
+    # linee vicino finestre: uso finestre gonfiate (già clampate)
     Xfin = linee_finestre(Xfull, all_w_infl, "x")
     Yfin = linee_finestre(Yfull, all_w_infl, "y")
 
-    # filtro globale SOLO X (Y no)
+    # filtro globale SOLO X
     EPS = 1e-9
     def _inside_any_x(x: float) -> bool:
         return any((w.x + EPS) < x < (w.x + w.w - EPS) for w in all_w_infl)
@@ -947,7 +1012,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xall = sorted(set(Xbase + Xfin + Xsec))
     Yall = sorted(set(Ybase + Yfin + Ysec))
 
-    # V/H raw (clipping su finestre gonfiate via DISTF=0 perché sono già inflate)
+    # V/H raw con clipping vs finestre gonfiate clampate (DISTF=0 perché sono già gonfiate)
     v_raw: List[Tuple[float, float, float]] = []
     h_raw: List[Tuple[float, float, float]] = []
 
@@ -989,7 +1054,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     width_cm = cols[-1].x_axis
     height_cm = beams[-1].y_axis - beams[0].y_axis
     area_tot_m2 = (width_cm * height_cm) / 10_000
-    area_open_m2 = sum(w.w * w.h for w in all_w) / 10_000
+    area_open_m2 = sum(w.w * w.h for w in all_w_real) / 10_000
     area_pieno_m2 = max(area_tot_m2 - area_open_m2, 1e-6)
 
     def inc(n, a):
@@ -1016,8 +1081,9 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "area_tot_m2": float(round(area_tot_m2, 6)),
     }
 
-    # stiffness
-    rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w, EA=EA, CLEAR=CLEAR, DISTF=DISTF)
+    # stiffness: diagonali_rigidezze usa ok_seg(..., DISTF=DISTF) internamente (pad),
+    # ma noi vogliamo finestre già gonfiate+clampate: passiamo DISTF=0 e wins=infl
+    rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w_infl, EA=EA, CLEAR=CLEAR, DISTF=0)
 
     Aeq_dict: Dict[Tuple[int, int], float] = {}
     Keq_dict: Dict[Tuple[int, int], float] = {}
@@ -1125,7 +1191,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "structure": {
                 "beams": [{"y": b.y_axis, "sp": b.spess} for b in beams],
                 "columns": [{"x": c.x_axis, "sp": c.spess} for c in cols],
-                "windows": [{"x": w.x, "y": w.y_abs, "w": w.w, "h": w.h} for w in all_w],
+                "windows": [{"x": w.x, "y": w.y_abs, "w": w.w, "h": w.h} for w in all_w_real],
             },
             "panels": panels,
         },
@@ -1133,8 +1199,8 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "Aeq_univoca_mm2": float(round(Aeq_univoca, 2)),
             "Aeq_by_panel_mm2": {f"{i},{j}": v for (i, j), v in Aeq_dict.items()},
             "Keq_by_panel_N_per_mm": {f"{i},{j}": v for (i, j), v in Keq_dict.items()},
-            "stats": stats,              # invariato
-            "stats_table": stats_table,  # aggiunto
+            "stats": stats,
+            "stats_table": stats_table,
         },
         "overlays": overlays,
         "internals": {
@@ -1147,7 +1213,9 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "Keq_dict": Keq_dict,
             "beams": beams,
             "cols": cols,
-            "all_w": all_w,
+            "all_w_real": all_w_real,
+            "all_w_infl": all_w_infl,
+            "win_data": win_data,
             "DISTF": DISTF,
             "v_segs_pruned": v_segs,
             "h_segs_pruned": h_segs,
@@ -1160,24 +1228,27 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out_dir: Path) -> Dict[str, Optional[Path]]:
     cfg = parse_payload(payload)
+
     export_png = cfg["export_png"]
     export_pdf = cfg["export_pdf"]
     export_dxf = cfg["export_dxf"]
-
     if not (export_png or export_pdf or export_dxf):
         export_png = export_pdf = export_dxf = True
 
     job_id = cfg["job_id"]
     meta_norm = cfg["meta_norm"]
-    DISTF = cfg["DISTF"]
 
     Xall = computed["internals"]["Xall"]
     Yall = computed["internals"]["Yall"]
     Xbase = computed["internals"]["Xbase"]
     Ybase = computed["internals"]["Ybase"]
+
     cols = computed["internals"]["cols"]
     beams = computed["internals"]["beams"]
-    all_w = computed["internals"]["all_w"]
+
+    all_w_real = computed["internals"]["all_w_real"]
+    all_w_infl = computed["internals"]["all_w_infl"]
+
     matrices_for_pdf = computed["internals"]["matrices_for_pdf"]
     Aeq_dict = computed["internals"]["Aeq_dict"]
     Keq_dict = computed["internals"]["Keq_dict"]
@@ -1216,7 +1287,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
                 ax.add_patch(plt.Rectangle((x_min, b.y_axis - b.spess / 2), x_max - x_min, b.spess, fc="#d0d0d0", ec="none"))
             for c in cols:
                 ax.add_patch(plt.Rectangle((c.x_axis - c.spess / 2, y_min), c.spess, y_max - y_min, fc="#a0a0a0", ec="none"))
-            for w in all_w:
+            for w in all_w_real:
                 ax.add_patch(plt.Rectangle((w.x, w.y_abs), w.w, w.h, fill=False, ec="blue", lw=1.4))
 
             ax.set_xlim(x_min - 10, x_max + 10)
@@ -1237,7 +1308,6 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         for y, x1, x2 in h_segs:
             ax.plot([x1, x2], [y, y], "k", lw=0.7)
 
-        all_w_infl = inflate_windows(all_w, DISTF)
         for i in range(len(Xall) - 1):
             for j in range(len(Yall) - 1):
                 a, b = Xall[i], Xall[i + 1]
@@ -1305,7 +1375,14 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
                 written["pdf_final"] = final_pdf
 
     if export_dxf:
-        dxf_ok = _export_dxf(cols, beams, all_w, Xall, Yall, DISTF=DISTF, Xbase=Xbase, Ybase=Ybase, path=dxf_path)
+        dxf_ok = _export_dxf(
+            cols, beams,
+            finestre_real=all_w_real,
+            finestre_infl=all_w_infl,
+            X=Xall, Y=Yall,
+            Xbase=Xbase, Ybase=Ybase,
+            path=dxf_path
+        )
         if dxf_ok:
             written["dxf"] = dxf_path
 
