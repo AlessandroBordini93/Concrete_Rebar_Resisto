@@ -6,7 +6,6 @@
 #
 # Rimane invariato:
 # - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
-# - Filtro globale SOLO X per Xfin; Yfin senza filtro globale
 # - Border-safe per ok_seg + clipping
 # - Prune “trattini” V/H
 #
@@ -14,6 +13,11 @@
 # - n_o e n_v calcolati come "tratti atomici" (split ai nodi/intersezioni) dopo prune
 # - passo medio = media dei passi tra linee Xall e Yall (no mediana)
 # - diagonali invariati
+#
+# MOD DI OGGI (MIGLIORIA richiesta dall'immagine):
+# - Eliminazione/skip di una suddivisione secondaria X "dentro finestra gonfiata" vale SOLO
+#   se la finestra gonfiata è nello STESSO specchio murario (stesso pannello i,j).
+#   Quindi Xfin è calcolato PER-PANNELLO. Niente più filtro globale Xfin su tutta la parete.
 
 from __future__ import annotations
 
@@ -64,7 +68,7 @@ except ImportError:
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 app = FastAPI(
     title="RebarCA API",
-    version="2.3 (zip-on-the-fly, stats_table, x-only-filter, border-safe, window-real-validate, distf-clamped-to-panel)",
+    version="2.4 (zip-on-the-fly, stats_table, border-safe, window-real-validate, distf-clamped-to-panel, Xfin-per-panel)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -255,7 +259,7 @@ def inflate_window_clamped_to_panel(
 
     return Window(
         x=xa - pad_l,
-        y_rel=w.y_rel,  # non usato nel calcolo geometrico (solo info)
+        y_rel=w.y_rel,
         w=w.w + pad_l + pad_r,
         h=w.h + pad_b + pad_t,
         y_abs=ya - pad_b,
@@ -266,24 +270,36 @@ def build_inflated_windows_clamped(
     cols: List[Column],
     beams: List[Beam],
     DISTF: float,
-) -> List[Window]:
-    out: List[Window] = []
+) -> Tuple[List[Window], Dict[Tuple[int, int], List[Window]]]:
+    """
+    Ritorna:
+      - all_w_infl: lista piatta (utile per clipping/ok_seg)
+      - infl_by_panel: dict (i,j)->lista finestre gonfiate clampate (utile per Xfin PER SPECCHIO)
+    """
+    all_w_infl: List[Window] = []
+    infl_by_panel: Dict[Tuple[int, int], List[Window]] = {}
+
     for (i, j), lst in win_data.items():
+        out_lst: List[Window] = []
         for w in lst:
-            out.append(inflate_window_clamped_to_panel(w, i=i, j=j, cols=cols, beams=beams, DISTF=DISTF))
-    return out
+            wi = inflate_window_clamped_to_panel(w, i=i, j=j, cols=cols, beams=beams, DISTF=DISTF)
+            out_lst.append(wi)
+            all_w_infl.append(wi)
+        infl_by_panel[(i, j)] = out_lst
+
+    return all_w_infl, infl_by_panel
 
 
 def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> List[float]:
     """
-    Regola:
+    Regola (LOCALE rispetto alla lista wins_gonf passata):
       - asse="x": scelgo sx/dx per ogni finestra gonfiata, SKIPPANDO candidati che cadono
-        dentro QUALSIASI finestra gonfiata (filtro globale X).
+        dentro QUALSIASI finestra gonfiata presente in wins_gonf.
       - asse="y": scelgo giù/su per ogni finestra gonfiata, SENZA filtro globale.
     """
     grid = sorted(grid)
 
-    def ok_axis_value_global_x(x: float) -> bool:
+    def ok_axis_value_local_x(x: float) -> bool:
         for w in wins_gonf:
             if w.x < x < (w.x + w.w):  # strict inside
                 return False
@@ -296,11 +312,11 @@ def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> Lis
             R = w.x + w.w
 
             i_sx = bisect.bisect_right(grid, L) - 1
-            while i_sx >= 0 and not ok_axis_value_global_x(grid[i_sx]):
+            while i_sx >= 0 and not ok_axis_value_local_x(grid[i_sx]):
                 i_sx -= 1
 
             i_dx = bisect.bisect_left(grid, R)
-            while i_dx < len(grid) and not ok_axis_value_global_x(grid[i_dx]):
+            while i_dx < len(grid) and not ok_axis_value_local_x(grid[i_dx]):
                 i_dx += 1
 
             if i_sx >= 0:
@@ -608,7 +624,7 @@ def diagonali_rigidezze(
 def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines: List[str]):
     W, H = A4
     h1, h3 = H / 6, 3 * H / 6
-    c = canvas.Canvas(str(out_pdf), pagesize=A4)
+    c = canvas.Canvas(str(out_pdf), pagesize=A4) if False else canvas.Canvas(str(out_pdf), pagesize=A4)
 
     c.setFont(FONT_BOLD, 14)
     c.drawCentredString(W / 2, H - 0.75 * h1, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
@@ -653,6 +669,7 @@ def _extra_pages(
     W, H = A4
     MARGX = 2 * cm
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
+
 
     def _draw_equations(y0: float) -> float:
         c.setFont("Helvetica-Oblique", 9)
@@ -991,23 +1008,23 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     win_data: Dict[Tuple[int, int], List[Window]] = cfg["win_data"]
     all_w_real = [w for lst in win_data.values() for w in lst]
 
-    # finestre gonfiate CLAMPATE allo specchio murario del pannello
-    all_w_infl = build_inflated_windows_clamped(win_data, cols, beams, DISTF)
+    # finestre gonfiate CLAMPATE + mappa per pannello
+    all_w_infl, infl_by_panel = build_inflated_windows_clamped(win_data, cols, beams, DISTF)
 
     # primarie
     Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO, CLEAR=CLEAR)
     Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO, CLEAR=CLEAR)
 
-    # linee vicino finestre: uso finestre gonfiate (già clampate)
-    Xfin = linee_finestre(Xfull, all_w_infl, "x")
+    # linee vicino finestre:
+    # - Xfin calcolate PER PANNELLO (quindi "skip inside window" vale solo nello stesso specchio murario)
+    # - Yfin come prima su tutta la parete (nessun filtro globale)
+    Xfin_all: List[float] = []
+    for (_ij, wins_panel) in infl_by_panel.items():
+        if wins_panel:
+            Xfin_all.extend(linee_finestre(Xfull, wins_panel, "x"))
+    Xfin = sorted(set(Xfin_all))
+
     Yfin = linee_finestre(Yfull, all_w_infl, "y")
-
-    # filtro globale SOLO X
-    EPS = 1e-9
-    def _inside_any_x(x: float) -> bool:
-        return any((w.x + EPS) < x < (w.x + w.w - EPS) for w in all_w_infl)
-
-    Xfin = sorted(set(x for x in Xfin if not _inside_any_x(x)))
     Yfin = sorted(set(Yfin))
 
     # intermedie
@@ -1037,30 +1054,15 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     v_segs, h_segs = prune_vh_segments(Xall, Yall, Xbase, Ybase, v_raw, h_raw, nd=6)
 
     # ============================================================
-    # STATS (MODIFICATO SOLO QUI)
-    #
-    # Prima:
-    #   n_o = len(h_segs) / n_v = len(v_segs) -> sbagliato perché h_segs/v_segs sono MERGED
-    #   p_medio = (Lv/nv + Lh/no)/2 -> non è "passo", è "lunghezza media segmento"
-    #
-    # Ora:
-    #   - Lh/Lv = somma delle lunghezze dei segmenti pruned (coerente col disegno)
-    #   - n_o/n_v = numero dei TRATTI ATOMICI tra intersezioni (split dopo prune)
-    #   - passo medio = media dei passi tra linee consecutive in Xall e Yall (no mediana)
-    #
-    # Diagonali: invariato (per-cella) perché ti torna già giusto.
+    # STATS
     # ============================================================
-
-    # 1) Lunghezze totali V/H (coerenti col disegno finale)
     Lh_cm = sum(x2 - x1 for (y, x1, x2) in h_segs)
     Lv_cm = sum(y2 - y1 for (x, y1, y2) in v_segs)
 
-    # 2) Conteggi "elementi" V/H come tratti atomici tra intersezioni
     edges_atomic, _adj_atomic = split_segments_at_intersections(v_segs, h_segs, nd=6)
     n_o = sum(1 for (_u, _v, t) in edges_atomic if t == "h")
     n_v = sum(1 for (_u, _v, t) in edges_atomic if t == "v")
 
-    # 3) Diagonali: INVARIATO (per cella)
     Ld_cm = 0.0
     n_d = 0
     for i in range(len(Xall) - 1):
@@ -1075,7 +1077,6 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
                 n_d += 1
                 Ld_cm += dlen
 
-    # 4) Aree: invariato
     width_cm = cols[-1].x_axis
     height_cm = beams[-1].y_axis - beams[0].y_axis
     area_tot_m2 = (width_cm * height_cm) / 10_000
@@ -1085,7 +1086,6 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     def inc(n, a):
         return n / 2.75 / a
 
-    # 5) Passo medio: media semplice dei passi tra linee consecutive (Xall/Yall)
     dx = [Xall[k + 1] - Xall[k] for k in range(len(Xall) - 1)]
     dy = [Yall[k + 1] - Yall[k] for k in range(len(Yall) - 1)]
     p_medio = ((sum(dx) / len(dx)) + (sum(dy) / len(dy))) / 2 if (dx and dy) else 0.0
@@ -1109,8 +1109,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "area_tot_m2": float(round(area_tot_m2, 6)),
     }
 
-    # stiffness: diagonali_rigidezze usa ok_seg(..., DISTF=DISTF) internamente (pad),
-    # ma noi vogliamo finestre già gonfiate+clampate: passiamo DISTF=0 e wins=infl
+    # stiffness: vogliamo finestre già gonfiate+clampate => DISTF=0
     rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w_infl, EA=EA, CLEAR=CLEAR, DISTF=0)
 
     Aeq_dict: Dict[Tuple[int, int], float] = {}
