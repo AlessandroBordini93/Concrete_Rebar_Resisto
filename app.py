@@ -2,22 +2,25 @@
 # MOD (ultima miglioria):
 # - DISTF = "finestra gonfiata", ma la gonfiatura viene CLAMPATA (tagliata) per rimanere
 #   SEMPRE dentro lo specchio murario del pannello (tra facce interne di pilastri e travi).
-#   Quindi: dove posso aggiungo DISTF; dove non posso aggiungo il massimo possibile.
 #
 # Rimane invariato:
 # - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
 # - Border-safe per ok_seg + clipping
 # - Prune “trattini” V/H
 #
-# MOD DI OGGI (SOLO STATISTICHE):
+# MOD (STATISTICHE):
 # - n_o e n_v calcolati come "tratti atomici" (split ai nodi/intersezioni) dopo prune
 # - passo medio = media dei passi tra linee Xall e Yall (no mediana)
 # - diagonali invariati
 #
-# MOD DI OGGI (MIGLIORIA richiesta dall'immagine):
-# - Eliminazione/skip di una suddivisione secondaria X "dentro finestra gonfiata" vale SOLO
-#   se la finestra gonfiata è nello STESSO specchio murario (stesso pannello i,j).
-#   Quindi Xfin è calcolato PER-PANNELLO. Niente più filtro globale Xfin su tutta la parete.
+# MOD (MIGLIORIA finestre):
+# - Xfin e Yfin calcolate PER-PANNELLO (stesso specchio murario i,j)
+# - Scarto di un candidato (linea vicino finestra gonfiata) NON basato su sovrapposizione finestre,
+#   ma su: "la linea candidata entra in un'altra finestra gonfiata concorrente".
+# - Concorrenza deterministica:
+#     * Per scarto X: considero solo finestre che OVERLAP in Y (asse ortogonale).
+#     * Per scarto Y: considero solo finestre che OVERLAP in X (asse ortogonale).
+#   Così evito falsi positivi nel caso "finestre affiancate in X con altezze diverse".
 
 from __future__ import annotations
 
@@ -68,7 +71,7 @@ except ImportError:
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 app = FastAPI(
     title="RebarCA API",
-    version="2.4 (zip-on-the-fly, stats_table, border-safe, window-real-validate, distf-clamped-to-panel, Xfin-per-panel)",
+    version="2.5 (zip-on-the-fly, stats_table, border-safe, window-real-validate, distf-clamped-to-panel, X/Yfin-per-panel, candidate-driven-skip)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -230,7 +233,6 @@ def inflate_window_clamped_to_panel(
     if DISTF <= 0:
         return w
 
-    # facce interne pannello (specchio murario)
     xmin = cols[j].x_axis + cols[j].spess / 2.0
     xmax = cols[j + 1].x_axis - cols[j + 1].spess / 2.0
     ymin = beams[i].y_axis + beams[i].spess / 2.0
@@ -241,13 +243,11 @@ def inflate_window_clamped_to_panel(
     xb = w.x + w.w
     yb = w.y_abs + w.h
 
-    # quanto "spazio" ho prima di uscire dal pannello
     pad_l = max(0.0, min(DISTF, xa - xmin))
     pad_r = max(0.0, min(DISTF, xmax - xb))
     pad_b = max(0.0, min(DISTF, ya - ymin))
     pad_t = max(0.0, min(DISTF, ymax - yb))
 
-    # se per qualche motivo siamo quasi sul bordo (numerica), clampo duro
     if xa - pad_l < xmin - eps:
         pad_l = max(0.0, xa - xmin)
     if xb + pad_r > xmax + eps:
@@ -271,11 +271,6 @@ def build_inflated_windows_clamped(
     beams: List[Beam],
     DISTF: float,
 ) -> Tuple[List[Window], Dict[Tuple[int, int], List[Window]]]:
-    """
-    Ritorna:
-      - all_w_infl: lista piatta (utile per clipping/ok_seg)
-      - infl_by_panel: dict (i,j)->lista finestre gonfiate clampate (utile per Xfin PER SPECCHIO)
-    """
     all_w_infl: List[Window] = []
     infl_by_panel: Dict[Tuple[int, int], List[Window]] = {}
 
@@ -290,53 +285,101 @@ def build_inflated_windows_clamped(
     return all_w_infl, infl_by_panel
 
 
-def linee_finestre(grid: List[float], wins_gonf: List[Window], asse: str) -> List[float]:
+# ============================================================
+# CANDIDATE-DRIVEN LINES NEAR WINDOWS (deterministico, per-pannello)
+# ============================================================
+def _overlap_strict(a1: float, a2: float, b1: float, b2: float, eps: float = 1e-9) -> bool:
+    lo1, hi1 = (a1, a2) if a1 <= a2 else (a2, a1)
+    lo2, hi2 = (b1, b2) if b1 <= b2 else (b2, b1)
+    return not (hi1 <= lo2 + eps or hi2 <= lo1 + eps)
+
+def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], asse: str, eps: float = 1e-9) -> List[float]:
     """
-    Regola (LOCALE rispetto alla lista wins_gonf passata):
-      - asse="x": scelgo sx/dx per ogni finestra gonfiata, SKIPPANDO candidati che cadono
-        dentro QUALSIASI finestra gonfiata presente in wins_gonf.
-      - asse="y": scelgo giù/su per ogni finestra gonfiata, SENZA filtro globale.
+    Per ogni finestra A in wins_gonf:
+      - asse="x": propone i candidati sx/dx (da grid), ma li scarta SOLO se il candidato entra
+                 in una finestra B concorrente (stesso pannello) tale che A e B overlap in Y.
+      - asse="y": propone i candidati giù/su (da grid), ma li scarta SOLO se il candidato entra
+                 in una finestra B concorrente tale che A e B overlap in X.
+
+    Nessun parametro "ratio/min_abs": concorrenza deterministica via overlap ortogonale.
     """
     grid = sorted(grid)
+    if not grid or not wins_gonf:
+        return []
 
-    def ok_axis_value_local_x(x: float) -> bool:
-        for w in wins_gonf:
-            if w.x < x < (w.x + w.w):  # strict inside
-                return False
-        return True
+    def x_inside(w: Window, x: float) -> bool:
+        return (w.x + eps) < x < (w.x + w.w - eps)
+
+    def y_inside(w: Window, y: float) -> bool:
+        return (w.y_abs + eps) < y < (w.y_abs + w.h - eps)
+
+    def competitors_for_x(wA: Window) -> List[Window]:
+        # concorrenti per X: overlap in Y
+        out = []
+        Ay1, Ay2 = wA.y_abs, wA.y_abs + wA.h
+        for wB in wins_gonf:
+            if wB is wA:
+                continue
+            By1, By2 = wB.y_abs, wB.y_abs + wB.h
+            if _overlap_strict(Ay1, Ay2, By1, By2, eps=eps):
+                out.append(wB)
+        return out
+
+    def competitors_for_y(wA: Window) -> List[Window]:
+        # concorrenti per Y: overlap in X
+        out = []
+        Ax1, Ax2 = wA.x, wA.x + wA.w
+        for wB in wins_gonf:
+            if wB is wA:
+                continue
+            Bx1, Bx2 = wB.x, wB.x + wB.w
+            if _overlap_strict(Ax1, Ax2, Bx1, Bx2, eps=eps):
+                out.append(wB)
+        return out
 
     extra: List[float] = []
-    for w in wins_gonf:
+
+    for wA in wins_gonf:
         if asse == "x":
-            L = w.x
-            R = w.x + w.w
+            L = wA.x
+            R = wA.x + wA.w
+            comps = competitors_for_x(wA)
 
+            # candidato sx: linea <= L, ma non deve stare dentro nessuna finestra concorrente
             i_sx = bisect.bisect_right(grid, L) - 1
-            while i_sx >= 0 and not ok_axis_value_local_x(grid[i_sx]):
+            while i_sx >= 0 and any(x_inside(wB, grid[i_sx]) for wB in comps):
                 i_sx -= 1
-
-            i_dx = bisect.bisect_left(grid, R)
-            while i_dx < len(grid) and not ok_axis_value_local_x(grid[i_dx]):
-                i_dx += 1
-
             if i_sx >= 0:
                 extra.append(grid[i_sx])
+
+            # candidato dx: linea >= R, ma non deve stare dentro nessuna finestra concorrente
+            i_dx = bisect.bisect_left(grid, R)
+            while i_dx < len(grid) and any(x_inside(wB, grid[i_dx]) for wB in comps):
+                i_dx += 1
             if i_dx < len(grid):
                 extra.append(grid[i_dx])
 
         else:
-            B = w.y_abs
-            T = w.y_abs + w.h
+            B = wA.y_abs
+            T = wA.y_abs + wA.h
+            comps = competitors_for_y(wA)
 
+            # candidato giù: linea <= B, ma non deve stare dentro nessuna finestra concorrente
             i_giu = bisect.bisect_right(grid, B) - 1
-            i_su = bisect.bisect_left(grid, T)
-
+            while i_giu >= 0 and any(y_inside(wB, grid[i_giu]) for wB in comps):
+                i_giu -= 1
             if i_giu >= 0:
                 extra.append(grid[i_giu])
+
+            # candidato su: linea >= T, ma non deve stare dentro nessuna finestra concorrente
+            i_su = bisect.bisect_left(grid, T)
+            while i_su < len(grid) and any(y_inside(wB, grid[i_su]) for wB in comps):
+                i_su += 1
             if i_su < len(grid):
                 extra.append(grid[i_su])
 
     return sorted(set(extra))
+
 
 def intermedie(lines: List[float], PASSO: int) -> List[float]:
     out: List[float] = []
@@ -383,7 +426,6 @@ def _subtract_intervals(base: Tuple[float, float], cuts: List[Tuple[float, float
     return [(x1, x2) for x1, x2 in out if x2 > x1]
 
 def clip_vertical_segment(x: float, y1: float, y2: float, wins: List[Window], DISTF: float, eps: float = 1e-9) -> List[Tuple[float, float]]:
-    # border-safe: taglio solo se la linea passa "dentro" (strict) la proiezione X della finestra gonfiata
     ya, yb = min(y1, y2), max(y1, y2)
     cuts: List[Tuple[float, float]] = []
     for w in wins:
@@ -393,7 +435,6 @@ def clip_vertical_segment(x: float, y1: float, y2: float, wins: List[Window], DI
     return _subtract_intervals((ya, yb), cuts)
 
 def clip_horizontal_segment(y: float, x1: float, x2: float, wins: List[Window], DISTF: float, eps: float = 1e-9) -> List[Tuple[float, float]]:
-    # border-safe: taglio solo se la linea passa "dentro" (strict) la proiezione Y della finestra gonfiata
     xa, xb = min(x1, x2), max(x1, x2)
     cuts: List[Tuple[float, float]] = []
     for w in wins:
@@ -624,7 +665,7 @@ def diagonali_rigidezze(
 def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines: List[str]):
     W, H = A4
     h1, h3 = H / 6, 3 * H / 6
-    c = canvas.Canvas(str(out_pdf), pagesize=A4) if False else canvas.Canvas(str(out_pdf), pagesize=A4)
+    c = canvas.Canvas(str(out_pdf), pagesize=A4)
 
     c.setFont(FONT_BOLD, 14)
     c.drawCentredString(W / 2, H - 0.75 * h1, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
@@ -669,7 +710,6 @@ def _extra_pages(
     W, H = A4
     MARGX = 2 * cm
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
-
 
     def _draw_equations(y0: float) -> float:
         c.setFont("Helvetica-Oblique", 9)
@@ -802,7 +842,6 @@ def _export_dxf(
     for b in beams:
         rect(x_min, b.y_axis - b.spess / 2, x_max, b.y_axis + b.spess / 2)
 
-    # disegno finestre REALI (non gonfiate)
     for w in finestre_real:
         rect(w.x, w.y_abs, w.x + w.w, w.y_abs + w.h)
 
@@ -811,7 +850,6 @@ def _export_dxf(
     v_raw: List[Tuple[float, float, float]] = []
     h_raw: List[Tuple[float, float, float]] = []
 
-    # clipping su finestre gonfiate CLAMPATE (DISTF=0 perché già gonfiate)
     for x in X:
         for y1, y2 in zip(Y[:-1], Y[1:]):
             for ya, yb in clip_vertical_segment(x, y1, y2, finestre_infl, DISTF=0):
@@ -903,7 +941,6 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     export_pdf = bool(export.get("pdf", False))
     export_dxf = bool(export.get("dxf", False))
 
-    # validazione finestre reali nello specchio (NO DISTF, NO CLEAR)
     EPSG = 1e-9
 
     for item in payload.get("openings", []):
@@ -1015,17 +1052,17 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO, CLEAR=CLEAR)
     Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO, CLEAR=CLEAR)
 
-    # linee vicino finestre:
-    # - Xfin calcolate PER PANNELLO (quindi "skip inside window" vale solo nello stesso specchio murario)
-    # - Yfin come prima su tutta la parete (nessun filtro globale)
+    # linee vicino finestre: Xfin & Yfin PER-PANNELLO (stesso specchio murario),
+    # candidate-driven con concorrenza deterministica
     Xfin_all: List[float] = []
+    Yfin_all: List[float] = []
     for (_ij, wins_panel) in infl_by_panel.items():
         if wins_panel:
-            Xfin_all.extend(linee_finestre(Xfull, wins_panel, "x"))
-    Xfin = sorted(set(Xfin_all))
+            Xfin_all.extend(linee_finestre_candidate_driven(Xfull, wins_panel, "x"))
+            Yfin_all.extend(linee_finestre_candidate_driven(Yfull, wins_panel, "y"))
 
-    Yfin = linee_finestre(Yfull, all_w_infl, "y")
-    Yfin = sorted(set(Yfin))
+    Xfin = sorted(set(Xfin_all))
+    Yfin = sorted(set(Yfin_all))
 
     # intermedie
     Xsec = intermedie(sorted(set(Xbase + Xfin)), PASSO=PASSO)
@@ -1109,7 +1146,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "area_tot_m2": float(round(area_tot_m2, 6)),
     }
 
-    # stiffness: vogliamo finestre già gonfiate+clampate => DISTF=0
+    # stiffness: finestre già gonfiate+clampate => DISTF=0
     rig = diagonali_rigidezze(Xall, Yall, cols, beams, all_w_infl, EA=EA, CLEAR=CLEAR, DISTF=0)
 
     Aeq_dict: Dict[Tuple[int, int], float] = {}
