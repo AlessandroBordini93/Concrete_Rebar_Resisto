@@ -1,26 +1,15 @@
 # app.py — RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
-# MOD (ultima miglioria):
-# - DISTF = "finestra gonfiata", ma la gonfiatura viene CLAMPATA (tagliata) per rimanere
-#   SEMPRE dentro lo specchio murario del pannello (tra facce interne di pilastri e travi).
-#
-# Rimane invariato:
-# - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
-# - Border-safe per ok_seg + clipping
-# - Prune “trattini” V/H
-#
-# MOD (STATISTICHE):
-# - n_o e n_v calcolati come "tratti atomici" (split ai nodi/intersezioni) dopo prune
-# - passo medio = media dei passi tra linee Xall e Yall (no mediana)
-# - diagonali invariati
-#
-# MOD (MIGLIORIA finestre):
-# - Xfin e Yfin calcolate PER-PANNELLO (stesso specchio murario i,j)
-# - Scarto di un candidato (linea vicino finestra gonfiata) NON basato su sovrapposizione finestre,
-#   ma su: "la linea candidata entra in un'altra finestra gonfiata concorrente".
-# - Concorrenza deterministica:
-#     * Per scarto X: considero solo finestre che OVERLAP in Y (asse ortogonale).
-#     * Per scarto Y: considero solo finestre che OVERLAP in X (asse ortogonale).
-#   Così evito falsi positivi nel caso "finestre affiancate in X con altezze diverse".
+# MOD richieste (2026-01-08):
+# 1) passo medio differenziato:
+#    - passo_medio_x_cm, passo_medio_y_cm
+#    - passo_medio_cm = media tra (x,y)
+#    - stats + stats_table aggiornati
+# 2) PDF:
+#    - rimuovere stampa "STATISTICHE RINFORZO" e righe stats
+#    - rendere schema_png più grande e più in basso
+#    - header rinominato: Progetto / Posizione / Parete | Revisione
+# 3) Allegati ZIP export:
+#    - includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
 
 from __future__ import annotations
 
@@ -71,7 +60,7 @@ except ImportError:
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 app = FastAPI(
     title="RebarCA API",
-    version="2.5 (zip-on-the-fly, stats_table, border-safe, window-real-validate, distf-clamped-to-panel, X/Yfin-per-panel, candidate-driven-skip)",
+    version="2.6 (zip-on-the-fly, stats_table, border-safe, window-real-validate, distf-clamped-to-panel, X/Yfin-per-panel, candidate-driven-skip, passo-medio-x-y, pdf-no-stats, zip-only-pdf-dxf)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -663,37 +652,43 @@ def diagonali_rigidezze(
 # PDF GENERATORS
 # ============================================================
 def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines: List[str]):
+    # NOTE: stats è mantenuto come parametro per compatibilità interna,
+    # ma NON viene più stampato nel PDF (richiesta utente).
     W, H = A4
-    h1, h3 = H / 6, 3 * H / 6
+
+    # più spazio all'header per evitare tagli; immagine più grande e più in basso
+    h1 = H / 4.6   # prima era H/6 (troppo stretto)
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
 
     c.setFont(FONT_BOLD, 14)
-    c.drawCentredString(W / 2, H - 0.75 * h1, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
+    c.drawCentredString(W / 2, H - 0.55 * cm, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
 
     c.setFont(FONT_REG, 11)
-    y = H - h1 + 0.3 * cm
+    y = H - 1.45 * cm
     for ln in header_lines:
         c.drawCentredString(W / 2, y, ln)
-        y -= 0.45 * cm
+        y -= 0.55 * cm  # più interlinea per leggibilità
 
     img = ImageReader(str(schema_png))
     iw, ih = img.getSize()
-    h_img = min(h3 - 1 * cm, ih)
+
+    # area disponibile: dal fondo header fino a footer
+    footer_space = 2.1 * cm
+    top_limit = H - (h1)  # in pratica fine area header
+    bottom_limit = footer_space + 0.8 * cm
+    avail_h = top_limit - bottom_limit
+    avail_w = W - 2.0 * cm
+
+    # immagine più grande: prova a saturare altezza disponibile
+    h_img = min(avail_h, ih)
     w_img = h_img * iw / ih
-    if w_img > W - 2 * cm:
-        w_img = W - 2 * cm
+    if w_img > avail_w:
+        w_img = avail_w
         h_img = w_img * ih / iw
 
-    c.drawImage(img, (W - w_img) / 2, H - h1 - h_img - 0.5 * cm, w_img, h_img)
-
-    c.setFont(FONT_REG, 10)
-    y0 = H - h1 - h3 - 0.5 * cm
-    c.drawString(2 * cm, y0, "======================== STATISTICHE RINFORZO ========================")
-    y = y0 - 0.45 * cm
-    for ln in stats:
-        c.drawString(2 * cm, y, ln)
-        y -= 0.40 * cm
-    c.drawString(2 * cm, y, "======================================================================")
+    # spostata leggermente verso il basso (dentro l'area disponibile)
+    y_img = bottom_limit + (avail_h - h_img) * 0.35
+    c.drawImage(img, (W - w_img) / 2, y_img, w_img, h_img)
 
     _footer(c, W, H)
     c.save()
@@ -1123,15 +1118,20 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     def inc(n, a):
         return n / 2.75 / a
 
+    # passo medio X/Y + media
     dx = [Xall[k + 1] - Xall[k] for k in range(len(Xall) - 1)]
     dy = [Yall[k + 1] - Yall[k] for k in range(len(Yall) - 1)]
-    p_medio = ((sum(dx) / len(dx)) + (sum(dy) / len(dy))) / 2 if (dx and dy) else 0.0
+    passo_medio_x = (sum(dx) / len(dx)) if dx else 0.0
+    passo_medio_y = (sum(dy) / len(dy)) if dy else 0.0
+    p_medio = (passo_medio_x + passo_medio_y) / 2 if (dx and dy) else (passo_medio_x or passo_medio_y or 0.0)
 
     stats = [
         f"Orizzontali : L = {Lh_cm/100:.2f} m | n = {n_o} | Inc. P {inc(n_o,area_pieno_m2):.2f} T {inc(n_o,area_tot_m2):.2f}",
         f"Verticali : L = {Lv_cm/100:.2f} m | n = {n_v} | Inc. P {inc(n_v,area_pieno_m2):.2f} T {inc(n_v,area_tot_m2):.2f}",
         f"Diagonali : L = {Ld_cm/100:.2f} m | n = {n_d} --> 2 x n°: {n_d/2:.0f} | Inc. P {inc(n_d,area_pieno_m2):.2f} T {inc(n_d,area_tot_m2):.2f}",
         "======================================================================",
+        f"Passo medio X = {passo_medio_x:.1f} cm",
+        f"Passo medio Y = {passo_medio_y:.1f} cm",
         f"Passo medio = {p_medio:.1f} cm",
         f"Area pieno (senza aperture) : {area_pieno_m2:.2f} m²",
         f"Area totale : {area_tot_m2:.2f} m²",
@@ -1141,6 +1141,8 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "orizzontali": {"L_m": float(round(Lh_cm / 100.0, 4)), "n": int(n_o), "inc_p": float(round(inc(n_o, area_pieno_m2), 4)), "inc_t": float(round(inc(n_o, area_tot_m2), 4))},
         "verticali": {"L_m": float(round(Lv_cm / 100.0, 4)), "n": int(n_v), "inc_p": float(round(inc(n_v, area_pieno_m2), 4)), "inc_t": float(round(inc(n_v, area_tot_m2), 4))},
         "diagonali": {"L_m": float(round(Ld_cm / 100.0, 4)), "n": int(n_d), "n_x2": float(round(n_d / 2.0, 4)), "inc_p": float(round(inc(n_d, area_pieno_m2), 4)), "inc_t": float(round(inc(n_d, area_tot_m2), 4))},
+        "passo_medio_x_cm": float(round(passo_medio_x, 3)),
+        "passo_medio_y_cm": float(round(passo_medio_y, 3)),
         "passo_medio_cm": float(round(p_medio, 3)),
         "area_pieno_m2": float(round(area_pieno_m2, 6)),
         "area_tot_m2": float(round(area_tot_m2, 6)),
@@ -1263,8 +1265,8 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "Aeq_univoca_mm2": float(round(Aeq_univoca, 2)),
             "Aeq_by_panel_mm2": {f"{i},{j}": v for (i, j), v in Aeq_dict.items()},
             "Keq_by_panel_N_per_mm": {f"{i},{j}": v for (i, j), v in Keq_dict.items()},
-            "stats": stats,
-            "stats_table": stats_table,
+            "stats": stats,                 # ✅ continua a tornare al front-end
+            "stats_table": stats_table,     # ✅ con nuovi campi passo medio x/y
         },
         "overlays": overlays,
         "internals": {
@@ -1332,14 +1334,18 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
     extra_pdf = out_dir / f"{job_id}_01_extra.pdf"
     final_pdf = out_dir / f"{job_id}_Report_resisto59_completo.pdf"
 
+    # Header rinominato (richiesta)
     header_lines = [
-        f"Project: {meta_norm['project_name']}",
-        f"Location: {meta_norm['location_name']}",
-        f"Wall: {meta_norm['wall_orientation']} | Suffix: {meta_norm['suffix']}",
+        f"Progetto: {meta_norm['project_name']}",
+        f"Posizione: {meta_norm['location_name']}",
+        f"Parete: {meta_norm['wall_orientation']} | Revisione: {meta_norm['suffix']}",
     ]
 
     written: Dict[str, Optional[Path]] = {"schema_png": None, "grafico1_png": None, "grafico2_png": None, "pdf_final": None, "dxf": None}
 
+    # NOTA: anche se vogliamo nello ZIP solo PDF finale + DXF,
+    # i PNG e PDF intermedi sono ancora generati internamente perché servono al PDF finale.
+    # Però NON verranno inclusi nello ZIP (gestito in /export).
     if export_png or export_pdf:
         def base_axes(ax):
             x_min = cols[0].x_axis - cols[0].spess / 2
@@ -1421,6 +1427,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             written["grafico2_png"] = grafico2_png
 
         if export_pdf:
+            # ✅ stats NON più stampate in PDF (ma continuano nel JSON)
             _first_page(schema_png, stats, first_pdf, header_lines=header_lines)
             _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
 
@@ -1480,13 +1487,20 @@ def export(payload: Payload):
 
         with tempfile.TemporaryDirectory(prefix="rebarca_") as tmp:
             out_dir = Path(tmp)
-            _ = render_exports_to_dir(data, computed, out_dir=out_dir)
+            written = render_exports_to_dir(data, computed, out_dir=out_dir)
 
+            # ✅ ZIP: solo PDF finale + DXF (se presenti)
             mem = BytesIO()
             with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                for p in sorted(out_dir.glob(f"{job_id}_*")):
-                    if p.is_file():
-                        z.write(p, arcname=p.name)
+                pdf_final = written.get("pdf_final")
+                dxf = written.get("dxf")
+
+                if pdf_final and Path(pdf_final).is_file():
+                    z.write(pdf_final, arcname=Path(pdf_final).name)
+
+                if dxf and Path(dxf).is_file():
+                    z.write(dxf, arcname=Path(dxf).name)
+
             mem.seek(0)
 
             filename = f"{job_id}_allegati.zip"
