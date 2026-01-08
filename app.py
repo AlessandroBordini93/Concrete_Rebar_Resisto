@@ -1,15 +1,21 @@
 # app.py — RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
-# MOD richieste (2026-01-08):
-# 1) passo medio differenziato:
+#
+# MOD richieste:
+# 1) Statistiche: passo medio differenziato
 #    - passo_medio_x_cm, passo_medio_y_cm
 #    - passo_medio_cm = media tra (x,y)
-#    - stats + stats_table aggiornati
 # 2) PDF:
-#    - rimuovere stampa "STATISTICHE RINFORZO" e righe stats
-#    - rendere schema_png più grande e più in basso
+#    - rimuovere stampa statistiche rinforzo
 #    - header rinominato: Progetto / Posizione / Parete | Revisione
-# 3) Allegati ZIP export:
+#    - schema_png più grande: crop automatico del bianco + fit quasi full-page
+# 3) ZIP export:
 #    - includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
+#
+# Rimane invariato:
+# - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
+# - Border-safe per ok_seg + clipping
+# - Prune “trattini” V/H
+# - Logica di compute invariata salvo stats e PDF layout
 
 from __future__ import annotations
 
@@ -29,6 +35,8 @@ from io import BytesIO
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import numpy as np
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -60,7 +68,7 @@ except ImportError:
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 app = FastAPI(
     title="RebarCA API",
-    version="2.6 (zip-on-the-fly, stats_table, border-safe, window-real-validate, distf-clamped-to-panel, X/Yfin-per-panel, candidate-driven-skip, passo-medio-x-y, pdf-no-stats, zip-only-pdf-dxf)",
+    version="2.7 (passo-medio-x-y, pdf-no-stats, pdf-schema-crop+full, zip-only-pdf-dxf)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -151,6 +159,47 @@ def _footer(c: canvas.Canvas, W, H):
     c.drawCentredString(W / 2, 0.75 * h5, "Ing. Alessandro Bordini")
     c.drawCentredString(W / 2, 0.35 * h5, "Phone: 3451604706 - ✉: alessandro_bordini@outlook.com")
 
+def _crop_png_whitespace(png_path: Path, pad_px: int = 12) -> Optional[BytesIO]:
+    """
+    Ritaglia i bordi bianchi di un PNG e restituisce un BytesIO (PNG) pronto per ImageReader.
+    Se fallisce per qualsiasi motivo, ritorna None (fallback: usa png originale).
+    """
+    try:
+        img = mpimg.imread(str(png_path))  # (H,W,3) o (H,W,4), float [0..1]
+        if img.ndim != 3:
+            return None
+
+        if img.shape[2] == 4:
+            rgb = img[:, :, :3]
+            alpha = img[:, :, 3]
+        else:
+            rgb = img[:, :, :3]
+            alpha = np.ones(rgb.shape[:2], dtype=rgb.dtype)
+
+        tol = 0.98
+        nonwhite = (alpha > 0.05) & (np.min(rgb, axis=2) < tol)
+
+        if not np.any(nonwhite):
+            return None
+
+        ys, xs = np.where(nonwhite)
+        y1, y2 = int(ys.min()), int(ys.max())
+        x1, x2 = int(xs.min()), int(xs.max())
+
+        y1 = max(0, y1 - pad_px)
+        x1 = max(0, x1 - pad_px)
+        y2 = min(img.shape[0] - 1, y2 + pad_px)
+        x2 = min(img.shape[1] - 1, x2 + pad_px)
+
+        cropped = img[y1:y2 + 1, x1:x2 + 1, :]
+
+        buf = BytesIO()
+        plt.imsave(buf, cropped)
+        buf.seek(0)
+        return buf
+    except Exception:
+        return None
+
 
 # ============================================================
 # GEOMETRY UTILITIES
@@ -159,7 +208,6 @@ def win_box(w: Window, pad: float = 0.0) -> Tuple[float, float, float, float]:
     return (w.x - pad, w.y_abs - pad, w.x + w.w + pad, w.y_abs + w.h + pad)
 
 def _box_intersect_strict(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], eps: float = 1e-9) -> bool:
-    # "strict": contatto sul bordo NON conta come intersezione
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     return not (ax2 <= bx1 + eps or ax1 >= bx2 - eps or ay2 <= by1 + eps or ay1 >= by2 - eps)
@@ -283,15 +331,6 @@ def _overlap_strict(a1: float, a2: float, b1: float, b2: float, eps: float = 1e-
     return not (hi1 <= lo2 + eps or hi2 <= lo1 + eps)
 
 def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], asse: str, eps: float = 1e-9) -> List[float]:
-    """
-    Per ogni finestra A in wins_gonf:
-      - asse="x": propone i candidati sx/dx (da grid), ma li scarta SOLO se il candidato entra
-                 in una finestra B concorrente (stesso pannello) tale che A e B overlap in Y.
-      - asse="y": propone i candidati giù/su (da grid), ma li scarta SOLO se il candidato entra
-                 in una finestra B concorrente tale che A e B overlap in X.
-
-    Nessun parametro "ratio/min_abs": concorrenza deterministica via overlap ortogonale.
-    """
     grid = sorted(grid)
     if not grid or not wins_gonf:
         return []
@@ -303,7 +342,6 @@ def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], 
         return (w.y_abs + eps) < y < (w.y_abs + w.h - eps)
 
     def competitors_for_x(wA: Window) -> List[Window]:
-        # concorrenti per X: overlap in Y
         out = []
         Ay1, Ay2 = wA.y_abs, wA.y_abs + wA.h
         for wB in wins_gonf:
@@ -315,7 +353,6 @@ def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], 
         return out
 
     def competitors_for_y(wA: Window) -> List[Window]:
-        # concorrenti per Y: overlap in X
         out = []
         Ax1, Ax2 = wA.x, wA.x + wA.w
         for wB in wins_gonf:
@@ -334,14 +371,12 @@ def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], 
             R = wA.x + wA.w
             comps = competitors_for_x(wA)
 
-            # candidato sx: linea <= L, ma non deve stare dentro nessuna finestra concorrente
             i_sx = bisect.bisect_right(grid, L) - 1
             while i_sx >= 0 and any(x_inside(wB, grid[i_sx]) for wB in comps):
                 i_sx -= 1
             if i_sx >= 0:
                 extra.append(grid[i_sx])
 
-            # candidato dx: linea >= R, ma non deve stare dentro nessuna finestra concorrente
             i_dx = bisect.bisect_left(grid, R)
             while i_dx < len(grid) and any(x_inside(wB, grid[i_dx]) for wB in comps):
                 i_dx += 1
@@ -353,14 +388,12 @@ def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], 
             T = wA.y_abs + wA.h
             comps = competitors_for_y(wA)
 
-            # candidato giù: linea <= B, ma non deve stare dentro nessuna finestra concorrente
             i_giu = bisect.bisect_right(grid, B) - 1
             while i_giu >= 0 and any(y_inside(wB, grid[i_giu]) for wB in comps):
                 i_giu -= 1
             if i_giu >= 0:
                 extra.append(grid[i_giu])
 
-            # candidato su: linea >= T, ma non deve stare dentro nessuna finestra concorrente
             i_su = bisect.bisect_left(grid, T)
             while i_su < len(grid) and any(y_inside(wB, grid[i_su]) for wB in comps):
                 i_su += 1
@@ -368,7 +401,6 @@ def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[Window], 
                 extra.append(grid[i_su])
 
     return sorted(set(extra))
-
 
 def intermedie(lines: List[float], PASSO: int) -> List[float]:
     out: List[float] = []
@@ -652,43 +684,44 @@ def diagonali_rigidezze(
 # PDF GENERATORS
 # ============================================================
 def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines: List[str]):
-    # NOTE: stats è mantenuto come parametro per compatibilità interna,
-    # ma NON viene più stampato nel PDF (richiesta utente).
+    # stats non stampate nel PDF (ma restano nel JSON)
     W, H = A4
-
-    # più spazio all'header per evitare tagli; immagine più grande e più in basso
-    h1 = H / 4.6   # prima era H/6 (troppo stretto)
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
 
+    # Titolo
     c.setFont(FONT_BOLD, 14)
     c.drawCentredString(W / 2, H - 0.55 * cm, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
 
+    # Header compatto
     c.setFont(FONT_REG, 11)
     y = H - 1.45 * cm
     for ln in header_lines:
         c.drawCentredString(W / 2, y, ln)
-        y -= 0.55 * cm  # più interlinea per leggibilità
+        y -= 0.50 * cm
 
-    img = ImageReader(str(schema_png))
+    # Area disponibile per lo schema
+    footer_space = 2.1 * cm
+    bottom_limit = footer_space + 0.55 * cm
+    top_limit = y - 0.35 * cm
+    avail_h = max(10.0, top_limit - bottom_limit)
+    avail_w = W - 1.2 * cm
+
+    # Crop bianco
+    cropped_buf = _crop_png_whitespace(schema_png, pad_px=12)
+    if cropped_buf is not None:
+        img = ImageReader(cropped_buf)
+    else:
+        img = ImageReader(str(schema_png))
+
     iw, ih = img.getSize()
 
-    # area disponibile: dal fondo header fino a footer
-    footer_space = 2.1 * cm
-    top_limit = H - (h1)  # in pratica fine area header
-    bottom_limit = footer_space + 0.8 * cm
-    avail_h = top_limit - bottom_limit
-    avail_w = W - 2.0 * cm
+    scale = min(avail_w / iw, avail_h / ih)
+    w_img = iw * scale
+    h_img = ih * scale
 
-    # immagine più grande: prova a saturare altezza disponibile
-    h_img = min(avail_h, ih)
-    w_img = h_img * iw / ih
-    if w_img > avail_w:
-        w_img = avail_w
-        h_img = w_img * ih / iw
-
-    # spostata leggermente verso il basso (dentro l'area disponibile)
-    y_img = bottom_limit + (avail_h - h_img) * 0.35
-    c.drawImage(img, (W - w_img) / 2, y_img, w_img, h_img)
+    x_img = (W - w_img) / 2
+    y_img = bottom_limit + (avail_h - h_img) / 2
+    c.drawImage(img, x_img, y_img, w_img, h_img)
 
     _footer(c, W, H)
     c.save()
@@ -1047,8 +1080,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO, CLEAR=CLEAR)
     Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO, CLEAR=CLEAR)
 
-    # linee vicino finestre: Xfin & Yfin PER-PANNELLO (stesso specchio murario),
-    # candidate-driven con concorrenza deterministica
+    # linee vicino finestre per pannello
     Xfin_all: List[float] = []
     Yfin_all: List[float] = []
     for (_ij, wins_panel) in infl_by_panel.items():
@@ -1118,7 +1150,6 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     def inc(n, a):
         return n / 2.75 / a
 
-    # passo medio X/Y + media
     dx = [Xall[k + 1] - Xall[k] for k in range(len(Xall) - 1)]
     dy = [Yall[k + 1] - Yall[k] for k in range(len(Yall) - 1)]
     passo_medio_x = (sum(dx) / len(dx)) if dx else 0.0
@@ -1265,8 +1296,8 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "Aeq_univoca_mm2": float(round(Aeq_univoca, 2)),
             "Aeq_by_panel_mm2": {f"{i},{j}": v for (i, j), v in Aeq_dict.items()},
             "Keq_by_panel_N_per_mm": {f"{i},{j}": v for (i, j), v in Keq_dict.items()},
-            "stats": stats,                 # ✅ continua a tornare al front-end
-            "stats_table": stats_table,     # ✅ con nuovi campi passo medio x/y
+            "stats": stats,
+            "stats_table": stats_table,
         },
         "overlays": overlays,
         "internals": {
@@ -1334,7 +1365,6 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
     extra_pdf = out_dir / f"{job_id}_01_extra.pdf"
     final_pdf = out_dir / f"{job_id}_Report_resisto59_completo.pdf"
 
-    # Header rinominato (richiesta)
     header_lines = [
         f"Progetto: {meta_norm['project_name']}",
         f"Posizione: {meta_norm['location_name']}",
@@ -1343,9 +1373,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 
     written: Dict[str, Optional[Path]] = {"schema_png": None, "grafico1_png": None, "grafico2_png": None, "pdf_final": None, "dxf": None}
 
-    # NOTA: anche se vogliamo nello ZIP solo PDF finale + DXF,
-    # i PNG e PDF intermedi sono ancora generati internamente perché servono al PDF finale.
-    # Però NON verranno inclusi nello ZIP (gestito in /export).
+    # Genero PNG e PDF (internamente) per produrre il PDF finale
     if export_png or export_pdf:
         def base_axes(ax):
             x_min = cols[0].x_axis - cols[0].spess / 2
@@ -1427,7 +1455,6 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             written["grafico2_png"] = grafico2_png
 
         if export_pdf:
-            # ✅ stats NON più stampate in PDF (ma continuano nel JSON)
             _first_page(schema_png, stats, first_pdf, header_lines=header_lines)
             _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
 
@@ -1489,7 +1516,7 @@ def export(payload: Payload):
             out_dir = Path(tmp)
             written = render_exports_to_dir(data, computed, out_dir=out_dir)
 
-            # ✅ ZIP: solo PDF finale + DXF (se presenti)
+            # ZIP: solo PDF finale + DXF
             mem = BytesIO()
             with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 pdf_final = written.get("pdf_final")
@@ -1502,7 +1529,6 @@ def export(payload: Payload):
                     z.write(dxf, arcname=Path(dxf).name)
 
             mem.seek(0)
-
             filename = f"{job_id}_allegati.zip"
             return StreamingResponse(
                 mem,
