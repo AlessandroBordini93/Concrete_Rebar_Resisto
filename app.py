@@ -84,7 +84,7 @@ FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 
 # Scala manuale solo per lo schema PNG principale (schema_png)
 # 1.0 = come oggi, 1.2 = più grande, 0.8 = più piccolo, ecc.
-SCHEMA_PNG_SCALE = 1.0
+SCHEMA_PNG_SCALE = 0.8
 
 app = FastAPI(
     title="RebarCA API",
