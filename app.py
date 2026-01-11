@@ -1,36 +1,34 @@
 # app.py — RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
 #
-# MOD richieste (già incluse):
-# 1) Statistiche: passo medio differenziato
-#    - passo_medio_x_cm, passo_medio_y_cm
-#    - passo_medio_cm = media tra (x,y)
+# INVARIATO:
+# - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
+# - Border-safe per ok_seg + clipping
+# - Prune “trattini” V/H
+# - Logica di compute invariata salvo stats e PDF layout + filtro aggiuntivo richiesto
+#
+# MOD (già incluse):
+# 1) Statistiche: passo medio differenziato (x/y) + media
 # 2) PDF:
 #    - rimuovere stampa statistiche rinforzo
 #    - header rinominato: Progetto / Posizione / Parete | Revisione
 #    - schema_png più grande: crop automatico del bianco + fit quasi full-page
-# 3) ZIP export:
-#    - includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
-#
-# FIX inclusi (minimo impatto, solo filtro a valle):
-# A) Eliminare suddivisioni NON primarie (Xfin/Yfin e Xsec/Ysec) se cadono
-#    dentro o SUI BORDI di travi e pilastri.
-#    (logica di creazione candidate-driven e intermedie invariata)
-#
-# B) Normalizzazione BEAMS in parse_payload (solo backend, nessun cambio JSON schema):
-#    Il frontend fornisce travi+travate TOP -> BOTTOM, il motore lavora BOTTOM -> TOP.
-#    Quindi: reverse di beams.spessori_cm e beams.interassi_cm.
-#    Columns restano LEFT -> RIGHT (immutate).
+# 3) ZIP export: includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
+# 4) FIX:
+#    A) Eliminare suddivisioni NON primarie (Xfin/Yfin e Xsec/Ysec) se cadono
+#       dentro o SUI BORDI di travi e pilastri.
+#    B) Normalizzazione BEAMS in parse_payload: reverse spessori+interassi (TOP->BOTTOM => BOTTOM->TOP)
 #
 # NEW:
 # - buildingType nel JSON:
-#   * "telaio" => PDF come prima (schema + extra + merge)
-#   * "muratura" => PDF: 1ª pagina schema, 2ª pagina riepilogo muratura
-#     (valori fissi eccetto passo_medio_x_cm e passo_medio_y_cm dal compute)
+#   * "telaio" (default per qualsiasi altro valore, es: "cemento_armato") => PDF come oggi (schema + extra + merge)
+#   * "muratura" => PDF: 1ª pagina schema, 2ª pagina riepilogo muratura (valori fissi + passo medio x/y)
 #
-# ULTERIORI RITOCCHI:
-# 1) Rimosso il riquadro grigio dalla pagina riepilogo muratura
-# 2) Aggiunto fattore di scala modificabile a mano per il grafico schema_png
-#    (SCHEMA_PNG_SCALE)
+# FIX richiesti:
+# 1) Nel report muratura rimossa la cornice/riquadro grigio in seconda pagina
+# 2) SCHEMA scale passabile da query parameter: ?schema_scale=...
+#    - valido per /preview e /export
+#    - default 1.0 se non passato
+#    - clamp 0.2..5.0
 
 from __future__ import annotations
 
@@ -53,7 +51,7 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import numpy as np
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import RootModel
 
@@ -81,14 +79,11 @@ except ImportError:
 # CONFIG
 # ============================================================
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
-
-# Scala manuale solo per lo schema PNG principale (schema_png)
-# 1.0 = come oggi, 1.2 = più grande, 0.8 = più piccolo, ecc.
-SCHEMA_PNG_SCALE = 0.8
+DEFAULT_SCHEMA_SCALE = 1.0  # default se non arriva query param
 
 app = FastAPI(
     title="RebarCA API",
-    version="2.9 (muratura page no-rect + schema_png scale factor)",
+    version="2.10 (schema_scale query param + muratura page clean)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -777,21 +772,18 @@ def _muratura_summary_page(
         c.drawString(left + 5.2 * cm, y, value)
         return y - 0.50 * cm
 
-    # --- Armatura eq Verticale ---
     y = draw_block_title("Armatura eq Verticale:", y)
     y = draw_kv("Area:", "1,18 cm² [1Ø12]", y)
     y = draw_kv("Passo:", f"{passo_medio_x_cm:.1f} cm", y)
 
     y -= 0.35 * cm
 
-    # --- Armatura eq Orizzontale ---
     y = draw_block_title("Armatura eq Orizzontale:", y)
     y = draw_kv("Area:", "1,18 cm² [1Ø12]", y)
     y = draw_kv("Passo:", f"{passo_medio_y_cm:.1f} cm", y)
 
     y -= 0.55 * cm
 
-    # --- Dati fissi ---
     y = draw_block_title("Parametri:", y)
     y = draw_kv("Materiale:", "B450", y)
     y = draw_kv("Drift taglio:", "0,008", y)
@@ -988,11 +980,17 @@ def _export_dxf(
 # PARSE PAYLOAD
 # ============================================================
 def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # buildingType (nuovo parametro): default "telaio" se assente
+    # buildingType (nuovo parametro): default "telaio" se assente/altro
     building_type = (payload.get("buildingType") or payload.get("building_type") or "telaio").strip().lower()
     if building_type not in {"telaio", "muratura"}:
-        # compatibilità: se valore strano => telaio
         building_type = "telaio"
+
+    # schema scale da query param (iniettato nei endpoints come "__schema_scale")
+    try:
+        schema_scale = float(payload.get("__schema_scale", DEFAULT_SCHEMA_SCALE))
+    except Exception:
+        schema_scale = DEFAULT_SCHEMA_SCALE
+    schema_scale = max(0.2, min(schema_scale, 5.0))
 
     meta = payload.get("meta", {})
     project_name = meta.get("project_name", "")
@@ -1101,6 +1099,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "job_id": job_id,
         "building_type": building_type,
+        "schema_scale": schema_scale,
         "meta_norm": {
             "project_name": project_name,
             "location_name": location_name,
@@ -1445,6 +1444,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
     job_id = cfg["job_id"]
     meta_norm = cfg["meta_norm"]
     building_type = cfg.get("building_type", "telaio")
+    schema_scale = float(cfg.get("schema_scale", DEFAULT_SCHEMA_SCALE))
 
     Xall = computed["internals"]["Xall"]
     Yall = computed["internals"]["Yall"]
@@ -1486,7 +1486,13 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         f"Parete: {meta_norm['wall_orientation']} | Revisione: {meta_norm['suffix']}",
     ]
 
-    written: Dict[str, Optional[Path]] = {"schema_png": None, "grafico1_png": None, "grafico2_png": None, "pdf_final": None, "dxf": None}
+    written: Dict[str, Optional[Path]] = {
+        "schema_png": None,
+        "grafico1_png": None,
+        "grafico2_png": None,
+        "pdf_final": None,
+        "dxf": None,
+    }
 
     # Genero PNG e PDF (internamente) per produrre il PDF finale
     if export_png or export_pdf:
@@ -1510,9 +1516,9 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             ax.grid(True)
 
         # ------------------------------
-        # schema_png con scala manuale
+        # schema_png con scala da query
         # ------------------------------
-        fig, ax = plt.subplots(figsize=(7 * SCHEMA_PNG_SCALE, 4 * SCHEMA_PNG_SCALE))
+        fig, ax = plt.subplots(figsize=(7 * schema_scale, 4 * schema_scale))
         ax.set_aspect("equal")
         base_axes(ax)
         ax.set_title("Schema di Posa Resisto 5.9")
@@ -1537,7 +1543,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         fig.savefig(schema_png, dpi=300)
         plt.close(fig)
 
-        # (grafici equivalenti invariati)
+        # grafico1
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
@@ -1553,6 +1559,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         fig.savefig(grafico1_png, dpi=300)
         plt.close(fig)
 
+        # grafico2
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
@@ -1574,10 +1581,9 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             written["grafico2_png"] = grafico2_png
 
         if export_pdf:
-            # 1) Prima pagina sempre uguale (schema)
+            # Prima pagina sempre uguale (schema)
             _first_page(schema_png, stats, first_pdf, header_lines=header_lines)
 
-            # 2) In base al buildingType cambia la 2ª parte e il merge finale
             merged = False
             if PdfWriter is not None:
                 wr = PdfWriter()
@@ -1629,9 +1635,13 @@ def health():
     return {"ok": True}
 
 @app.post("/preview")
-def preview(payload: Payload):
+def preview(
+    payload: Payload,
+    schema_scale: float = Query(default=1.0, ge=0.2, le=5.0),
+):
     try:
-        data = payload.root
+        data = dict(payload.root)
+        data["__schema_scale"] = float(schema_scale)
         data = {**data, "export": {"png": False, "pdf": False, "dxf": False}}
         computed = compute(data)
         computed.pop("internals", None)
@@ -1640,9 +1650,14 @@ def preview(payload: Payload):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/export")
-def export(payload: Payload):
+def export(
+    payload: Payload,
+    schema_scale: float = Query(default=1.0, ge=0.2, le=5.0),
+):
     try:
-        data = payload.root
+        data = dict(payload.root)
+        data["__schema_scale"] = float(schema_scale)
+
         computed = compute(data)
         job_id = computed["job_id"]
 
