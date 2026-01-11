@@ -21,17 +21,16 @@
 #    Quindi: reverse di beams.spessori_cm e beams.interassi_cm.
 #    Columns restano LEFT -> RIGHT (immutate).
 #
-# NEW (richiesta utente):
-# - Supporto buildingType nel JSON:
-#   * buildingType="telaio" => PDF identico a prima (schema + extra + merge)
-#   * buildingType="muratura" => PDF: 1ª pagina schema, 2ª pagina riepilogo muratura
-#     (valori fissi eccetto passo_medio_x_cm e passo_medio_y_cm presi dal compute)
+# NEW:
+# - buildingType nel JSON:
+#   * "telaio" => PDF come prima (schema + extra + merge)
+#   * "muratura" => PDF: 1ª pagina schema, 2ª pagina riepilogo muratura
+#     (valori fissi eccetto passo_medio_x_cm e passo_medio_y_cm dal compute)
 #
-# Rimane invariato:
-# - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
-# - Border-safe per ok_seg + clipping
-# - Prune “trattini” V/H
-# - Logica di compute invariata salvo stats e PDF layout + filtro aggiuntivo richiesto
+# ULTERIORI RITOCCHI:
+# 1) Rimosso il riquadro grigio dalla pagina riepilogo muratura
+# 2) Aggiunto fattore di scala modificabile a mano per il grafico schema_png
+#    (SCHEMA_PNG_SCALE)
 
 from __future__ import annotations
 
@@ -82,9 +81,14 @@ except ImportError:
 # CONFIG
 # ============================================================
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
+
+# Scala manuale solo per lo schema PNG principale (schema_png)
+# 1.0 = come oggi, 1.2 = più grande, 0.8 = più piccolo, ecc.
+SCHEMA_PNG_SCALE = 1.0
+
 app = FastAPI(
     title="RebarCA API",
-    version="2.8 (buildingType pdf switch: telaio default + muratura summary page)",
+    version="2.9 (muratura page no-rect + schema_png scale factor)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -744,6 +748,7 @@ def _muratura_summary_page(
     passo_medio_x_cm: float,
     passo_medio_y_cm: float,
 ):
+    # Pagina riepilogo muratura (senza riquadro grigio)
     W, H = A4
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
 
@@ -758,7 +763,6 @@ def _muratura_summary_page(
 
     y -= 0.60 * cm
     left = 2.2 * cm
-    right = W - 2.2 * cm
 
     def draw_block_title(txt: str, y: float) -> float:
         c.setFont(FONT_BOLD, 12)
@@ -792,10 +796,6 @@ def _muratura_summary_page(
     y = draw_kv("Materiale:", "B450", y)
     y = draw_kv("Drift taglio:", "0,008", y)
     y = draw_kv("Drift P.F.:", "0,016", y)
-
-    # cornice leggera (solo estetica, non invasiva)
-    c.setStrokeColor(colors.lightgrey)
-    c.rect(left - 0.6 * cm, 2.7 * cm, (right - left) + 1.2 * cm, (y + 0.9 * cm) - 2.7 * cm, stroke=1, fill=0)
 
     _footer(c, W, H)
     c.save()
@@ -991,7 +991,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     # buildingType (nuovo parametro): default "telaio" se assente
     building_type = (payload.get("buildingType") or payload.get("building_type") or "telaio").strip().lower()
     if building_type not in {"telaio", "muratura"}:
-        # non blocco il calcolo: default a telaio per compatibilità
+        # compatibilità: se valore strano => telaio
         building_type = "telaio"
 
     meta = payload.get("meta", {})
@@ -1033,13 +1033,11 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     _must(all(v > 0 for v in spB + intB + spC + intC), "spessori/interassi devono essere >0")
 
     # ------------------------------------------------------------
-    # Normalizzazione BEAMS:
-    # Il frontend fornisce travi+travate TOP -> BOTTOM
-    # Il motore lavora BOTTOM -> TOP
+    # Normalizzazione BEAMS: TOP->BOTTOM (frontend) => BOTTOM->TOP (motore)
     # ------------------------------------------------------------
     spB = list(reversed(spB))
     intB = list(reversed(intB))
-    # Columns restano LEFT -> RIGHT (nessun reverse)
+    # Columns restano LEFT -> RIGHT
 
     y = [0.0]
     for v in intB:
@@ -1102,7 +1100,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "job_id": job_id,
-        "building_type": building_type,  # <--- nuovo (interno backend)
+        "building_type": building_type,
         "meta_norm": {
             "project_name": project_name,
             "location_name": location_name,
@@ -1446,7 +1444,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 
     job_id = cfg["job_id"]
     meta_norm = cfg["meta_norm"]
-    building_type = cfg.get("building_type", "telaio")  # <--- nuovo
+    building_type = cfg.get("building_type", "telaio")
 
     Xall = computed["internals"]["Xall"]
     Yall = computed["internals"]["Yall"]
@@ -1511,7 +1509,10 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             ax.set_ylabel("Y [cm]")
             ax.grid(True)
 
-        fig, ax = plt.subplots(figsize=(7, 4))
+        # ------------------------------
+        # schema_png con scala manuale
+        # ------------------------------
+        fig, ax = plt.subplots(figsize=(7 * SCHEMA_PNG_SCALE, 4 * SCHEMA_PNG_SCALE))
         ax.set_aspect("equal")
         base_axes(ax)
         ax.set_title("Schema di Posa Resisto 5.9")
@@ -1536,6 +1537,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
         fig.savefig(schema_png, dpi=300)
         plt.close(fig)
 
+        # (grafici equivalenti invariati)
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.set_aspect("equal")
         base_axes(ax)
@@ -1580,12 +1582,10 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             if PdfWriter is not None:
                 wr = PdfWriter()
 
-                # aggiungo sempre la prima
                 for p in PdfReader(str(first_pdf)).pages:
                     wr.add_page(p)
 
                 if building_type == "muratura":
-                    # seconda pagina: riepilogo muratura (NO extra pages)
                     _muratura_summary_page(
                         muratura_pdf,
                         header_lines=header_lines,
@@ -1595,7 +1595,6 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
                     for p in PdfReader(str(muratura_pdf)).pages:
                         wr.add_page(p)
                 else:
-                    # telaio (default): comportamento identico a prima
                     _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
                     for p in PdfReader(str(extra_pdf)).pages:
                         wr.add_page(p)
