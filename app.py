@@ -12,8 +12,9 @@
 #    - includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
 #
 # FIX richiesto (minimo impatto):
-# - Le suddivisioni secondarie (Xsec/Ysec) che cadono dentro o SUI BORDI di travi/pilastri vanno eliminate
-# - NON cambia la logica di creazione delle secondarie (intermedie()), solo filtro a valle
+# - Eliminare le suddivisioni NON primarie (secondarie Xsec/Ysec + candidate-finestre Xfin/Yfin)
+#   che cadono dentro o SUI BORDI di travi/pilastri.
+# - NON cambia la logica di creazione (intermedie() e candidate-driven invariati): solo filtro a valle.
 #
 # Rimane invariato:
 # - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
@@ -1095,13 +1096,9 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xfin = sorted(set(Xfin_all))
     Yfin = sorted(set(Yfin_all))
 
-    # intermedie (LOGICA INVARIATA)
-    Xsec = intermedie(sorted(set(Xbase + Xfin)), PASSO=PASSO)
-    Ysec = intermedie(sorted(set(Ybase + Yfin)), PASSO=PASSO)
-
     # ------------------------------------------------------------
-    # FIX: elimina SOLO le secondarie che cadono dentro o SUI BORDI
-    # di pilastri/travi. (creazione intermedie invariata)
+    # FIX: elimina le NON primarie (Xfin/Yfin) dentro o sui bordi
+    # di pilastri/travi. Le primarie Xbase/Ybase restano invariate.
     # ------------------------------------------------------------
     EPSG = 1e-6
 
@@ -1111,6 +1108,17 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     def _inside_any_beam_inclusive(y: float) -> bool:
         return any(abs(y - b.y_axis) <= (b.spess / 2 + EPSG) for b in beams)
 
+    Xfin = [x for x in Xfin if not _inside_any_column_inclusive(x)]
+    Yfin = [y for y in Yfin if not _inside_any_beam_inclusive(y)]
+
+    # intermedie (LOGICA INVARIATA)
+    Xsec = intermedie(sorted(set(Xbase + Xfin)), PASSO=PASSO)
+    Ysec = intermedie(sorted(set(Ybase + Yfin)), PASSO=PASSO)
+
+    # ------------------------------------------------------------
+    # FIX: elimina le NON primarie (Xsec/Ysec) dentro o sui bordi
+    # di pilastri/travi. (creazione intermedie invariata)
+    # ------------------------------------------------------------
     Xsec = [x for x in Xsec if not _inside_any_column_inclusive(x)]
     Ysec = [y for y in Ysec if not _inside_any_beam_inclusive(y)]
 
