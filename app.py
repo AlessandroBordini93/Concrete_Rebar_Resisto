@@ -11,6 +11,10 @@
 # 3) ZIP export:
 #    - includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
 #
+# FIX richiesto (minimo impatto):
+# - Le suddivisioni secondarie (Xsec/Ysec) che cadono dentro o SUI BORDI di travi/pilastri vanno eliminate
+# - NON cambia la logica di creazione delle secondarie (intermedie()), solo filtro a valle
+#
 # Rimane invariato:
 # - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
 # - Border-safe per ok_seg + clipping
@@ -1091,9 +1095,24 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Xfin = sorted(set(Xfin_all))
     Yfin = sorted(set(Yfin_all))
 
-    # intermedie
+    # intermedie (LOGICA INVARIATA)
     Xsec = intermedie(sorted(set(Xbase + Xfin)), PASSO=PASSO)
     Ysec = intermedie(sorted(set(Ybase + Yfin)), PASSO=PASSO)
+
+    # ------------------------------------------------------------
+    # FIX: elimina SOLO le secondarie che cadono dentro o SUI BORDI
+    # di pilastri/travi. (creazione intermedie invariata)
+    # ------------------------------------------------------------
+    EPSG = 1e-6
+
+    def _inside_any_column_inclusive(x: float) -> bool:
+        return any(abs(x - c.x_axis) <= (c.spess / 2 + EPSG) for c in cols)
+
+    def _inside_any_beam_inclusive(y: float) -> bool:
+        return any(abs(y - b.y_axis) <= (b.spess / 2 + EPSG) for b in beams)
+
+    Xsec = [x for x in Xsec if not _inside_any_column_inclusive(x)]
+    Ysec = [y for y in Ysec if not _inside_any_beam_inclusive(y)]
 
     Xall = sorted(set(Xbase + Xfin + Xsec))
     Yall = sorted(set(Ybase + Yfin + Ysec))
