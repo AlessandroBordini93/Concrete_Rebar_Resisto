@@ -21,6 +21,12 @@
 #    Quindi: reverse di beams.spessori_cm e beams.interassi_cm.
 #    Columns restano LEFT -> RIGHT (immutate).
 #
+# NEW (richiesta utente):
+# - Supporto buildingType nel JSON:
+#   * buildingType="telaio" => PDF identico a prima (schema + extra + merge)
+#   * buildingType="muratura" => PDF: 1ª pagina schema, 2ª pagina riepilogo muratura
+#     (valori fissi eccetto passo_medio_x_cm e passo_medio_y_cm presi dal compute)
+#
 # Rimane invariato:
 # - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
 # - Border-safe per ok_seg + clipping
@@ -78,7 +84,7 @@ except ImportError:
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 app = FastAPI(
     title="RebarCA API",
-    version="2.7 (passo-medio-x-y, pdf-no-stats, pdf-schema-crop+full, zip-only-pdf-dxf, filter-nonprim-on-struct, beams-topdown)",
+    version="2.8 (buildingType pdf switch: telaio default + muratura summary page)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -731,6 +737,69 @@ def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines:
     _footer(c, W, H)
     c.save()
 
+def _muratura_summary_page(
+    out_pdf: Path,
+    header_lines: List[str],
+    *,
+    passo_medio_x_cm: float,
+    passo_medio_y_cm: float,
+):
+    W, H = A4
+    c = canvas.Canvas(str(out_pdf), pagesize=A4)
+
+    c.setFont(FONT_BOLD, 14)
+    c.drawCentredString(W / 2, H - 0.55 * cm, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
+
+    c.setFont(FONT_REG, 11)
+    y = H - 1.45 * cm
+    for ln in header_lines:
+        c.drawCentredString(W / 2, y, ln)
+        y -= 0.50 * cm
+
+    y -= 0.60 * cm
+    left = 2.2 * cm
+    right = W - 2.2 * cm
+
+    def draw_block_title(txt: str, y: float) -> float:
+        c.setFont(FONT_BOLD, 12)
+        c.setFillColor(colors.black)
+        c.drawString(left, y, txt)
+        return y - 0.55 * cm
+
+    def draw_kv(label: str, value: str, y: float) -> float:
+        c.setFont(FONT_BOLD, 11)
+        c.drawString(left, y, label)
+        c.setFont(FONT_REG, 11)
+        c.drawString(left + 5.2 * cm, y, value)
+        return y - 0.50 * cm
+
+    # --- Armatura eq Verticale ---
+    y = draw_block_title("Armatura eq Verticale:", y)
+    y = draw_kv("Area:", "1,18 cm² [1Ø12]", y)
+    y = draw_kv("Passo:", f"{passo_medio_x_cm:.1f} cm", y)
+
+    y -= 0.35 * cm
+
+    # --- Armatura eq Orizzontale ---
+    y = draw_block_title("Armatura eq Orizzontale:", y)
+    y = draw_kv("Area:", "1,18 cm² [1Ø12]", y)
+    y = draw_kv("Passo:", f"{passo_medio_y_cm:.1f} cm", y)
+
+    y -= 0.55 * cm
+
+    # --- Dati fissi ---
+    y = draw_block_title("Parametri:", y)
+    y = draw_kv("Materiale:", "B450", y)
+    y = draw_kv("Drift taglio:", "0,008", y)
+    y = draw_kv("Drift P.F.:", "0,016", y)
+
+    # cornice leggera (solo estetica, non invasiva)
+    c.setStrokeColor(colors.lightgrey)
+    c.rect(left - 0.6 * cm, 2.7 * cm, (right - left) + 1.2 * cm, (y + 0.9 * cm) - 2.7 * cm, stroke=1, fill=0)
+
+    _footer(c, W, H)
+    c.save()
+
 def _extra_pages(
     matrices: Dict[Tuple[int, int], "pd.DataFrame"],
     Aeq: Dict[Tuple[int, int], float],
@@ -919,6 +988,12 @@ def _export_dxf(
 # PARSE PAYLOAD
 # ============================================================
 def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # buildingType (nuovo parametro): default "telaio" se assente
+    building_type = (payload.get("buildingType") or payload.get("building_type") or "telaio").strip().lower()
+    if building_type not in {"telaio", "muratura"}:
+        # non blocco il calcolo: default a telaio per compatibilità
+        building_type = "telaio"
+
     meta = payload.get("meta", {})
     project_name = meta.get("project_name", "")
     location_name = meta.get("location_name", "")
@@ -1027,6 +1102,7 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "job_id": job_id,
+        "building_type": building_type,  # <--- nuovo (interno backend)
         "meta_norm": {
             "project_name": project_name,
             "location_name": location_name,
@@ -1370,6 +1446,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 
     job_id = cfg["job_id"]
     meta_norm = cfg["meta_norm"]
+    building_type = cfg.get("building_type", "telaio")  # <--- nuovo
 
     Xall = computed["internals"]["Xall"]
     Yall = computed["internals"]["Yall"]
@@ -1390,6 +1467,9 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
 
     Aeq_univoca = computed["results"]["Aeq_univoca_mm2"]
     stats = computed["results"]["stats"]
+    stats_table = computed["results"].get("stats_table", {}) or {}
+    passo_medio_x_cm = float(stats_table.get("passo_medio_x_cm", 0.0))
+    passo_medio_y_cm = float(stats_table.get("passo_medio_y_cm", 0.0))
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1399,6 +1479,7 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
     dxf_path = out_dir / f"{job_id}_schema_posa_resisto59.dxf"
     first_pdf = out_dir / f"{job_id}_00_schema_statistiche.pdf"
     extra_pdf = out_dir / f"{job_id}_01_extra.pdf"
+    muratura_pdf = out_dir / f"{job_id}_01_muratura.pdf"
     final_pdf = out_dir / f"{job_id}_Report_resisto59_completo.pdf"
 
     header_lines = [
@@ -1491,16 +1572,34 @@ def render_exports_to_dir(payload: Dict[str, Any], computed: Dict[str, Any], out
             written["grafico2_png"] = grafico2_png
 
         if export_pdf:
+            # 1) Prima pagina sempre uguale (schema)
             _first_page(schema_png, stats, first_pdf, header_lines=header_lines)
-            _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
 
+            # 2) In base al buildingType cambia la 2ª parte e il merge finale
             merged = False
             if PdfWriter is not None:
                 wr = PdfWriter()
+
+                # aggiungo sempre la prima
                 for p in PdfReader(str(first_pdf)).pages:
                     wr.add_page(p)
-                for p in PdfReader(str(extra_pdf)).pages:
-                    wr.add_page(p)
+
+                if building_type == "muratura":
+                    # seconda pagina: riepilogo muratura (NO extra pages)
+                    _muratura_summary_page(
+                        muratura_pdf,
+                        header_lines=header_lines,
+                        passo_medio_x_cm=passo_medio_x_cm,
+                        passo_medio_y_cm=passo_medio_y_cm,
+                    )
+                    for p in PdfReader(str(muratura_pdf)).pages:
+                        wr.add_page(p)
+                else:
+                    # telaio (default): comportamento identico a prima
+                    _extra_pages(matrices_for_pdf, Aeq_dict, Keq_dict, grafico1_png, grafico2_png, Aeq_univoca, extra_pdf)
+                    for p in PdfReader(str(extra_pdf)).pages:
+                        wr.add_page(p)
+
                 with final_pdf.open("wb") as f:
                     wr.write(f)
                 merged = True
