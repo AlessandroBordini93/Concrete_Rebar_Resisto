@@ -1,6 +1,6 @@
 # app.py — RebarCA API (Metodo A: ZIP “al volo”, niente disco persistente)
 #
-# MOD richieste:
+# MOD richieste (già incluse):
 # 1) Statistiche: passo medio differenziato
 #    - passo_medio_x_cm, passo_medio_y_cm
 #    - passo_medio_cm = media tra (x,y)
@@ -11,16 +11,21 @@
 # 3) ZIP export:
 #    - includere solo Report_resisto59_completo.pdf e schema_posa_resisto59.dxf
 #
-# FIX richiesto (minimo impatto):
-# - Eliminare le suddivisioni NON primarie (secondarie Xsec/Ysec + candidate-finestre Xfin/Yfin)
-#   che cadono dentro o SUI BORDI di travi/pilastri.
-# - NON cambia la logica di creazione (intermedie() e candidate-driven invariati): solo filtro a valle.
+# FIX inclusi (minimo impatto, solo filtro a valle):
+# A) Eliminare suddivisioni NON primarie (Xfin/Yfin e Xsec/Ysec) se cadono
+#    dentro o SUI BORDI di travi e pilastri.
+#    (logica di creazione candidate-driven e intermedie invariata)
+#
+# B) Normalizzazione BEAMS in parse_payload (solo backend, nessun cambio JSON schema):
+#    Il frontend fornisce travi+travate TOP -> BOTTOM, il motore lavora BOTTOM -> TOP.
+#    Quindi: reverse di beams.spessori_cm e beams.interassi_cm.
+#    Columns restano LEFT -> RIGHT (immutate).
 #
 # Rimane invariato:
 # - JSON input/output, endpoint, payload, results.stats + results.stats_table, ecc.
 # - Border-safe per ok_seg + clipping
 # - Prune “trattini” V/H
-# - Logica di compute invariata salvo stats e PDF layout
+# - Logica di compute invariata salvo stats e PDF layout + filtro aggiuntivo richiesto
 
 from __future__ import annotations
 
@@ -73,7 +78,7 @@ except ImportError:
 FONT_REG, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 app = FastAPI(
     title="RebarCA API",
-    version="2.7 (passo-medio-x-y, pdf-no-stats, pdf-schema-crop+full, zip-only-pdf-dxf)",
+    version="2.7 (passo-medio-x-y, pdf-no-stats, pdf-schema-crop+full, zip-only-pdf-dxf, filter-nonprim-on-struct, beams-topdown)",
 )
 
 class Payload(RootModel[Dict[str, Any]]):
@@ -693,25 +698,21 @@ def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines:
     W, H = A4
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
 
-    # Titolo
     c.setFont(FONT_BOLD, 14)
     c.drawCentredString(W / 2, H - 0.55 * cm, "Calcolo Automatizzato – Schema di posa Resisto 5.9")
 
-    # Header compatto
     c.setFont(FONT_REG, 11)
     y = H - 1.45 * cm
     for ln in header_lines:
         c.drawCentredString(W / 2, y, ln)
         y -= 0.50 * cm
 
-    # Area disponibile per lo schema
     footer_space = 2.1 * cm
     bottom_limit = footer_space + 0.55 * cm
     top_limit = y - 0.35 * cm
     avail_h = max(10.0, top_limit - bottom_limit)
     avail_w = W - 1.2 * cm
 
-    # Crop bianco
     cropped_buf = _crop_png_whitespace(schema_png, pad_px=12)
     if cropped_buf is not None:
         img = ImageReader(cropped_buf)
@@ -719,7 +720,6 @@ def _first_page(schema_png: Path, stats: List[str], out_pdf: Path, header_lines:
         img = ImageReader(str(schema_png))
 
     iw, ih = img.getSize()
-
     scale = min(avail_w / iw, avail_h / ih)
     w_img = iw * scale
     h_img = ih * scale
@@ -957,6 +957,15 @@ def parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     _must(len(intC) == np_, "columns.interassi_cm deve avere lunghezza np")
     _must(all(v > 0 for v in spB + intB + spC + intC), "spessori/interassi devono essere >0")
 
+    # ------------------------------------------------------------
+    # Normalizzazione BEAMS:
+    # Il frontend fornisce travi+travate TOP -> BOTTOM
+    # Il motore lavora BOTTOM -> TOP
+    # ------------------------------------------------------------
+    spB = list(reversed(spB))
+    intB = list(reversed(intB))
+    # Columns restano LEFT -> RIGHT (nessun reverse)
+
     y = [0.0]
     for v in intB:
         y.append(y[-1] + v)
@@ -1097,7 +1106,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Yfin = sorted(set(Yfin_all))
 
     # ------------------------------------------------------------
-    # FIX: elimina le NON primarie (Xfin/Yfin) dentro o sui bordi
+    # FIX: elimina le NON primarie (Xfin/Yfin) dentro o SUI BORDI
     # di pilastri/travi. Le primarie Xbase/Ybase restano invariate.
     # ------------------------------------------------------------
     EPSG = 1e-6
@@ -1116,7 +1125,7 @@ def compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     Ysec = intermedie(sorted(set(Ybase + Yfin)), PASSO=PASSO)
 
     # ------------------------------------------------------------
-    # FIX: elimina le NON primarie (Xsec/Ysec) dentro o sui bordi
+    # FIX: elimina le NON primarie (Xsec/Ysec) dentro o SUI BORDI
     # di pilastri/travi. (creazione intermedie invariata)
     # ------------------------------------------------------------
     Xsec = [x for x in Xsec if not _inside_any_column_inclusive(x)]
